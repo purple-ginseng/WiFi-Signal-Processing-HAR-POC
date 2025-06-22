@@ -7,7 +7,7 @@ from sklearn.neighbors   import NearestNeighbors
 
 import matplotlib.pyplot as plt
 
-def plot_pca_knn(csv_folder="./data", k=5):
+def plot_pca_knn(csv_folder=".", k=5):
     # 1) Load & concatenate all CSVs
     csv_files = glob.glob(f"{csv_folder}/*.csv")
     if not csv_files:
@@ -15,7 +15,7 @@ def plot_pca_knn(csv_folder="./data", k=5):
     df = pd.concat((pd.read_csv(f) for f in csv_files), ignore_index=True)
 
     # 2) Extract features & labels
-    pkt_cols = [c for c in df.columns if c.startswith("pkt")]
+    pkt_cols = [c for c in df.columns if c.startswith("SCIDX_")]
     X = df[pkt_cols].apply(pd.to_numeric, errors="coerce").fillna(0).values  # shape (N,60)
     labels = df["label"].astype(str).values                               # shape (N,)
 
