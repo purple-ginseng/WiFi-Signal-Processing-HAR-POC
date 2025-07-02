@@ -25,7 +25,17 @@ def compute_attention(seq):
     scores = torch.matmul(x, x.T) / np.sqrt(x.shape[0])
     return F.softmax(scores, dim=-1).detach().numpy()
 
-def draw_spectrogram(signal, fs=200, cmap="viridis"):
+def draw_waveform(signal, fs=200):
+    fig, ax = plt.subplots(figsize=(8, 2))
+    t = np.linspace(0, len(signal)/fs, num=len(signal))
+    ax.plot(t, signal, linewidth=1)
+    ax.set_title("Waveform (RSSI Signal)")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Amplitude")
+    ax.grid(True)
+    return fig
+
+def draw_spectrogram(signal, fs=200, cmap="viridis", ylim=(0, 100)):
     f, t, Sxx = spectrogram(signal, fs=fs, nperseg=128, noverlap=64)
     Sxx_smooth = gaussian_filter(Sxx, sigma=1)
 
@@ -34,8 +44,8 @@ def draw_spectrogram(signal, fs=200, cmap="viridis"):
     ax.set_title("Spectrogram")
     ax.set_ylabel("Frequency (Hz)")
     ax.set_xlabel("Time (s)")
-    ax.set_ylim(5, 90)
-    ax.set_xlim(0, len(signal) / fs)  # dynamic time window
+    ax.set_ylim(*ylim)
+    ax.set_xlim(0, len(signal) / fs)
     fig.colorbar(pcm, ax=ax, label="Intensity")
     return fig
 
@@ -74,6 +84,7 @@ rows_needed = int(np.ceil(TARGET_LENGTH / samples_per_row))
 total_rows = len(df)
 
 cmap = st.sidebar.selectbox("🎨 Spectrogram Color Map", CMAPS)
+fmin, fmax = st.sidebar.slider("Spectrogram Y-Axis (Hz)", 0, int(FS//2), (0, 100))
 
 # Row index state
 if "row_index" not in st.session_state:
@@ -94,20 +105,22 @@ signal_matrix = window_df[pkt_cols].astype(float).values
 signal = signal_matrix.flatten()[:TARGET_LENGTH]
 
 # --- Validation ---
-label_block = window_df["label"].unique()
-label = label_block[0] if len(label_block) == 1 else "Mixed"
-if len(label_block) > 1:
-    st.warning(f"❗ Mixed labels in window: {label_block}")
+label = window_df["label"].mode()[0] if "label" in window_df else "N/A"
 if np.isnan(signal).any():
     st.error("NaN values found in signal — check CSV integrity.")
     st.stop()
+
+# Sidebar info
+st.sidebar.markdown(f"**Selected File:** `{os.path.basename(selected_file)}`")
+st.sidebar.markdown(f"**Label:** `{label}`")
 
 # --- Plotting ---
 st.markdown(f"**Rows:** {start_idx + 1} to {end_idx} | **Label:** `{label}`")
 col1, col2 = st.columns(2)
 
 with col1:
-    st.pyplot(draw_spectrogram(signal, fs=FS, cmap=cmap))
+    st.pyplot(draw_waveform(signal, fs=FS))
+    st.pyplot(draw_spectrogram(signal, fs=FS, cmap=cmap, ylim=(fmin, fmax)))
 
 with col2:
     attn = compute_attention(signal)

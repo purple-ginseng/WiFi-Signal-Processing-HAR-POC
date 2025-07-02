@@ -70,4 +70,4 @@ def plot_dual_csi_lines(csv_path: str, max_lines: int = 200):
     fig_phase.show()
 
 if __name__ == "__main__":
-    plot_dual_csi_lines("csi_full_log.csv", max_lines=200)
+    plot_dual_csi_lines("CSI_ESP32/csi_full_log.csv", max_lines=200)

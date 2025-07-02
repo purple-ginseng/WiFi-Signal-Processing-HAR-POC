@@ -187,62 +187,71 @@ class MainApp(tk.Tk):
         self.collect_btn.config(state="disabled")
         threading.Thread(target=target_fn, args=(lbl, duration), daemon=True).start()
 
-    def _do_csi_collection(self, label, duration, ip="0.0.0.0", port=12345):
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"esp32_csi_{label}_{timestamp}.csv"
-        path = os.path.join(DATA_DIR, fname)
-        os.makedirs(DATA_DIR, exist_ok=True)
+        def _do_csi_collection(self, label, duration, ip="0.0.0.0", port=12345):
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = f"esp32_csi_{label}_{timestamp}.csv"
+            path = os.path.join(DATA_DIR, fname)
+            os.makedirs(DATA_DIR, exist_ok=True)
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((ip, port))
-        sock.settimeout(1.0)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind((ip, port))
+            sock.settimeout(1.0)
 
-        start_ts = time.time()
-        rows = 0
+            start_ts = time.time()
+            rows = 0
 
-        self.progress.config(maximum=duration)
+            self.progress.config(maximum=duration)
 
-        try:
-            with open(path, 'w', newline='') as csvfile:
-                writer = csv.writer(csvfile)
+            try:
+                with open(path, 'w', newline='') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(["timestamp", "subcarrier_index", "I", "Q", "magnitude", "phase"])
 
-                while time.time() - start_ts < duration and not self._stop_csi.is_set():
-                    elapsed = int(time.time() - start_ts)
-                    self.progress['value'] = elapsed
-                    self.timer_label.config(text=f"Time Remaining: {max(duration - elapsed, 0)}s")
+                    while time.time() - start_ts < duration and not self._stop_csi.is_set():
+                        elapsed = int(time.time() - start_ts)
+                        self.progress['value'] = elapsed
+                        self.timer_label.config(text=f"Time Remaining: {max(duration - elapsed, 0)}s")
 
-                    try:
-                        data, _ = sock.recvfrom(4096)
-                        line = data.decode(errors="ignore").strip()
-                        if line:
-                            row = line.split(",")
-                            row.append(label)
-                            writer.writerow(row)
-                            rows += 1
+                        try:
+                            data, _ = sock.recvfrom(4096)
+                            line = data.decode(errors="ignore").strip()
+                            if not line:
+                                continue
 
-                            # Live plotting (first 200 values)
-                            try:
-                                floats = list(map(float, row[:-1]))[:200]
-                                self.csi_line.set_ydata(floats)
-                                self.csi_line.set_xdata(range(len(floats)))
+                            iq_values = list(map(int, line.split(",")))
+                            timestamp_now = round(time.time() - start_ts, 4)
+
+                            for idx in range(0, len(iq_values) - 1, 2):
+                                subcarrier_index = idx // 2
+                                I = iq_values[idx]
+                                Q = iq_values[idx + 1]
+                                magnitude = round((I**2 + Q**2)**0.5, 3)
+                                phase = round(np.degrees(np.arctan2(Q, I)), 2)
+                                writer.writerow([timestamp_now, subcarrier_index, I, Q, magnitude, phase])
+                                rows += 1
+
+                            # Optional: plot magnitude of subcarrier 0 only
+                            if len(iq_values) >= 2:
+                                I0, Q0 = iq_values[0], iq_values[1]
+                                mag0 = (I0**2 + Q0**2)**0.5
+                                self.csi_line.set_ydata([mag0])
+                                self.csi_line.set_xdata([0])
                                 self.csi_ax.relim()
                                 self.csi_ax.autoscale_view()
                                 self.csi_canvas.draw()
-                            except Exception:
-                                pass
 
-                    except socket.timeout:
-                        continue
+                        except socket.timeout:
+                            continue
 
-        finally:
-            sock.close()
+            finally:
+                sock.close()
 
-        self.progress['value'] = 0
-        self.timer_label.config(text="Time Remaining: 0s")
+            self.progress['value'] = 0
+            self.timer_label.config(text="Time Remaining: 0s")
+            self.collect_msg.config(text=f"Saved {rows} subcarrier rows → {fname}", foreground="green")
+            self.collect_btn.config(state="normal")
 
-        self.collect_msg.config(text=f"Saved {rows} rows → {fname}", foreground="green")
-        self.collect_btn.config(state="normal")
 
     def _do_collection_wrapper(self, label, duration):
         self._do_collection(label, duration)
