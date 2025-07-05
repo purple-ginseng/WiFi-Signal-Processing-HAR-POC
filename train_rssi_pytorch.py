@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from torch.cuda.amp import autocast, GradScaler
 
 from sklearn.decomposition import PCA
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import confusion_matrix, classification_report
@@ -31,11 +31,11 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 DATA_DIR = "./data"
-PCA_COMPONENTS = 50
+PCA_COMPONENTS = 0.99
 BATCH_SIZE = 2048
 EPOCHS = 100
 USE_PCA = True
-EARLY_STOPPING_PATIENCE = 15
+EARLY_STOPPING_PATIENCE = 1
 MODEL_PATH = "best_model.pt"
 RUN_NAME = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -47,9 +47,9 @@ class CNNLSTMModel(nn.Module):
         self.bn1 = nn.BatchNorm1d(64)
         self.pool = nn.MaxPool1d(2)
         self.dropout1 = nn.Dropout(0.5)
-        self.lstm = nn.LSTM(input_size=64, hidden_size=128, num_layers=2, batch_first=True, dropout=0.3)
+        self.lstm = nn.LSTM(input_size=64, hidden_size=512, num_layers=2, batch_first=True, dropout=0.3, bidirectional=True)
         self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(128, 64)
+        self.fc1 = nn.Linear(512 * 2, 64)
         self.dropout3 = nn.Dropout(0.5)
         self.fc2 = nn.Linear(64, num_classes)
 
@@ -61,7 +61,7 @@ class CNNLSTMModel(nn.Module):
         x = self.dropout1(x)
         x = x.permute(0, 2, 1)
         _, (h_n, _) = self.lstm(x)
-        x = h_n[-1]
+        x = torch.cat((h_n[-2], h_n[-1]), dim=1)
         x = self.dropout2(x)
         x = torch.relu(self.fc1(x))
         x = self.dropout3(x)
@@ -157,7 +157,7 @@ def train_and_evaluate(X, y, le):
             model = nn.DataParallel(model)
         model = model.to(device)
 
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        criterion = nn.CrossEntropyLoss(label_smoothing=0.1, weight=class_weights)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
         scaler = torch.cuda.amp.GradScaler()
