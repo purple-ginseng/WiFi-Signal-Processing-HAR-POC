@@ -15,6 +15,8 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks, Input
 from tensorflow.keras.mixed_precision import set_global_policy
 
+print(tf.config.list_physical_devices('GPU'))
+
 # --- GPU + AMP Optimization ---
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:

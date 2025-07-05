@@ -1,0 +1,5 @@
+0: falling
+1: sitting
+2: sleeping
+3: standing
+4: walking
