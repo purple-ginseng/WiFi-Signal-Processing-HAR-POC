@@ -35,7 +35,7 @@ PCA_COMPONENTS = 0.99
 BATCH_SIZE = 2048
 EPOCHS = 100
 USE_PCA = True
-EARLY_STOPPING_PATIENCE = 1
+EARLY_STOPPING_PATIENCE = 3
 MODEL_PATH = "best_model.pt"
 RUN_NAME = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -46,12 +46,14 @@ class CNNLSTMModel(nn.Module):
         self.conv1 = nn.Conv1d(1, 64, kernel_size=3)
         self.bn1 = nn.BatchNorm1d(64)
         self.pool = nn.MaxPool1d(2)
-        self.dropout1 = nn.Dropout(0.5)
-        self.lstm = nn.LSTM(input_size=64, hidden_size=512, num_layers=2, batch_first=True, dropout=0.3, bidirectional=True)
-        self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(512 * 2, 64)
+        self.dropout1 = nn.Dropout(0.6)
+        self.lstm = nn.LSTM(input_size=64, hidden_size=768, num_layers=2, batch_first=True, dropout=0.5, bidirectional=True)
+        self.dropout2 = nn.Dropout(0.6)
+        self.ln1 = nn.LayerNorm(768 * 2)
+        self.fc1 = nn.Linear(768 * 2, 128)
+        self.fc2 = nn.Linear(128, 64)
         self.dropout3 = nn.Dropout(0.5)
-        self.fc2 = nn.Linear(64, num_classes)
+        self.fc3 = nn.Linear(64, num_classes)
 
     def forward(self, x):
         x = x.unsqueeze(1)
@@ -62,10 +64,12 @@ class CNNLSTMModel(nn.Module):
         x = x.permute(0, 2, 1)
         _, (h_n, _) = self.lstm(x)
         x = torch.cat((h_n[-2], h_n[-1]), dim=1)
+        x = self.ln1(x)
         x = self.dropout2(x)
-        x = torch.relu(self.fc1(x))
+        x = torch.nn.functional.gelu(self.fc1(x))
+        x = torch.nn.functional.gelu(self.fc2(x))
         x = self.dropout3(x)
-        return self.fc2(x)
+        return self.fc3(x)
 
 # --- Data Loading ---
 def load_data():
@@ -176,6 +180,7 @@ def train_and_evaluate(X, y, le):
                     preds = model(xb)
                     loss = criterion(preds, yb)
                 scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 running_loss += loss.item()
