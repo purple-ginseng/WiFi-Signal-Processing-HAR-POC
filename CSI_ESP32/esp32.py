@@ -5,7 +5,7 @@ import time
 # --- CONFIGURATION ---
 SERIAL_PORT = "/dev/cu.usbserial-xxxx"  # Change this to your actual ESP32 port
 BAUD_RATE = 115200
-UDP_IP = "192.168.1.100"                # IP of your Raspberry Pi
+UDP_IP = "192.168.3.2"                # IP of your Raspberry Pi
 UDP_PORT = 12345
 
 # --- SETUP ---

@@ -12,7 +12,7 @@ import time
 
 DATA_DIR = "./data"
 FS = 200.0  # Sampling rate per subcarrier
-TARGET_LENGTH = int(FS * 10)  # 2000 samples over 10 seconds
+TARGET_LENGTH = int(FS * 30)  # 2000 samples over 30 seconds
 CMAPS = ["viridis", "jet", "turbo"]
 
 # --- Helper Functions ---
@@ -35,29 +35,29 @@ def draw_spectrogram(signal, fs=FS, cmap="viridis"):
     fig.colorbar(pcm, ax=ax, label="Intensity")
     return fig
 
-def draw_attention(attn_matrix):
+def draw_attention(attn_matrix, cmap):
     fig, ax = plt.subplots(figsize=(4, 4))
-    cax = ax.imshow(attn_matrix, cmap='viridis')
+    cax = ax.imshow(attn_matrix, cmap=cmap)
     ax.set_title("Attention Matrix")
     fig.colorbar(cax)
     return fig
 
-def draw_heatmap(matrix, title="CSI Heatmap"):
+def draw_heatmap(matrix, cmap, title="CSI Heatmap"):
     fig, ax = plt.subplots(figsize=(10, 4))
-    cax = ax.imshow(matrix, aspect='auto', cmap='turbo', origin='lower')
+    cax = ax.imshow(matrix, aspect='auto', cmap=cmap, origin='lower')
     ax.set_title(title)
     ax.set_xlabel("Time Frame")
     ax.set_ylabel("Subcarrier Index")
     fig.colorbar(cax, ax=ax, label="Magnitude")
     return fig
 
-def draw_doppler_phase_fft(complex_matrix):
+def draw_doppler_phase_fft(complex_matrix, cmap):
     phase_signal = np.unwrap(np.angle(complex_matrix), axis=0)
     fft_matrix = np.fft.fftshift(np.fft.fft(phase_signal, axis=0), axes=0)
     power = np.abs(fft_matrix) ** 2
 
     fig, ax = plt.subplots(figsize=(10, 4))
-    cax = ax.imshow(power.T, aspect='auto', cmap='plasma', origin='lower')
+    cax = ax.imshow(power.T, aspect='auto', cmap=cmap, origin='lower')
     ax.set_title("Doppler View (Phase FFT per Subcarrier)")
     ax.set_xlabel("Frequency Bin")
     ax.set_ylabel("Subcarrier Index")
@@ -136,13 +136,13 @@ with col1:
 
 with col2:
     attn = compute_attention(signal)
-    st.pyplot(draw_attention(attn))
+    st.pyplot(draw_attention(attn, cmap=cmap))
 
 st.markdown("### 🔍 CSI Subcarrier Magnitude Heatmap")
-st.pyplot(draw_heatmap(mag_window.T.values, title="Subcarrier vs Time (Magnitude)"))
+st.pyplot(draw_heatmap(mag_window.T.values, cmap=cmap, title="Subcarrier vs Time (Magnitude)"))
 
 st.markdown("### 🔁 Doppler Phase FFT View (per Subcarrier)")
-st.pyplot(draw_doppler_phase_fft(complex_window.values))
+st.pyplot(draw_doppler_phase_fft(complex_window.values, cmap=cmap))
 
 st.session_state.row_index += 1
 time.sleep(1 / 30)
