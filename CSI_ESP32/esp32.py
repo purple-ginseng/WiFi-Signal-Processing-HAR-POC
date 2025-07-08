@@ -1,28 +1,42 @@
-import socket
 import serial
+import socket
 import time
 
-# --- CONFIGURATION ---
-SERIAL_PORT = "/dev/cu.usbserial-xxxx"  # Change this to your actual ESP32 port
+# === CONFIGURATION ===
+SERIAL_PORT = '/dev/ttyUSB0'
 BAUD_RATE = 115200
-UDP_IP = "192.168.3.2"                # IP of your Raspberry Pi
-UDP_PORT = 12345
 
-# --- SETUP ---
-ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+UDP_TARGET_IP = "192.168.3.3"  # <- replace with your receiver IP
+UDP_TARGET_PORT = 12345
+
+# === Setup Serial + UDP ===
+ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-print(f"[INFO] Reading from {SERIAL_PORT}, sending to {UDP_IP}:{UDP_PORT}")
+print(f"[INFO] Listening on {SERIAL_PORT} and sending to {UDP_TARGET_IP}:{UDP_TARGET_PORT}")
+
+buffer = ""
 
 try:
     while True:
-        line = ser.readline().decode(errors='ignore').strip()
-        if line.startswith("CSI:"):
-            sock.sendto(line.encode(), (UDP_IP, UDP_PORT))
-            print(f"[SENT] {line[:60]}...")
-        time.sleep(0.005)
+        if ser.in_waiting:
+            raw_bytes = ser.read(ser.in_waiting)
+            buffer += raw_bytes.decode('utf-8', errors='ignore')
+
+            # Process complete lines
+            lines = buffer.split('\n')
+            buffer = lines[-1]  # save last (possibly incomplete) part for next round
+            for line in lines[:-1]:
+                line = line.strip()
+                if line.startswith("CSI:"):
+                    payload = line.encode('utf-8')
+                    sock.sendto(payload, (UDP_TARGET_IP, UDP_TARGET_PORT))
+                    print("[SENT]", line)
+
+        # Optional small sleep to prevent 100% CPU usage
+        time.sleep(0.001)
+
 except KeyboardInterrupt:
-    print("\n[INFO] Stopped.")
-finally:
+    print("\n[INFO] Stopped by user.")
     ser.close()
     sock.close()

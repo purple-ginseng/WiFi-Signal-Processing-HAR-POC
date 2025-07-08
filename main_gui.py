@@ -23,6 +23,7 @@ from sklearn.metrics import confusion_matrix, classification_report
 
 import tensorflow as tf
 from tensorflow.keras import layers, models, callbacks
+from tensorflow.keras.models import load_model
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -40,11 +41,12 @@ BATCH_SIZE_TF = 32
 
 class MainApp(tk.Tk):
     def __init__(self):
+        self.scaler = None
         super().__init__()
         self.title("Unified wifisignal Toolkit - WiFi Human Pose")
         self.geometry("1000x800")
 
-        self.chunk_size = tk.IntVar(value=300)
+        self.chunk_size = tk.IntVar(value=128)
         self.pred_thresh = tk.DoubleVar(value=0.5)
         self.pca = None
         self.label_encoder = None
@@ -65,6 +67,18 @@ class MainApp(tk.Tk):
         self._stop_pcap_transfer_loop()
         self.destroy()
 
+    def _load_trained_model(self):
+        try:
+            self.model = load_model("best_model.keras")
+            self.pca = joblib.load("pca_tf.pkl")
+            self.label_encoder = joblib.load("label_encoder_tf.pkl")
+            self.scaler = joblib.load("scaler.pkl")
+            print("[INFO] Model, PCA, Scaler, and LabelEncoder loaded successfully.")
+            return True
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Could not load model or preprocessors:\n{e}")
+            return False
+        
     def _start_pcap_transfer(self):
         if self.pcap_transfer_thread and self.pcap_transfer_thread.is_alive():
             return
@@ -188,7 +202,14 @@ class MainApp(tk.Tk):
         threading.Thread(target=target_fn, args=(lbl, duration), daemon=True).start()
 
     def _do_csi_collection(self, label, duration, ip="0.0.0.0", port=12345):
-        import math  # in case it's not already imported
+        import math
+        import datetime
+        import socket
+        import time
+        import os
+        import csv
+        import numpy as np
+
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         fname = f"esp32_csi_{label}_{timestamp}.csv"
         path = os.path.join(DATA_DIR, fname)
@@ -201,8 +222,12 @@ class MainApp(tk.Tk):
 
         start_ts = time.time()
         rows = 0
-
         self.progress.config(maximum=duration)
+
+        # For real-time plotting
+        csi_x_data = []
+        csi_y_data = []
+        MAX_POINTS = 200
 
         try:
             with open(path, 'w', newline='') as csvfile:
@@ -225,7 +250,7 @@ class MainApp(tk.Tk):
                         iq_values = list(map(int, iq_values))
 
                         if len(iq_values) < 2:
-                            continue  # Not enough data
+                            continue
 
                         for idx in range(0, len(iq_values) - 1, 2):
                             subcarrier_index = idx // 2
@@ -236,12 +261,19 @@ class MainApp(tk.Tk):
                             writer.writerow([elapsed, subcarrier_index, I, Q, magnitude, phase])
                             rows += 1
 
-                        # Optional real-time update
+                        # Real-time plot update
                         if len(iq_values) >= 2:
                             I0, Q0 = iq_values[0], iq_values[1]
-                            mag0 = (I0**2 + Q0**2)**0.5
-                            self.csi_line.set_ydata([mag0])
-                            self.csi_line.set_xdata([0])
+                            mag0 = (I0**2 + Q0**2) ** 0.5
+                            csi_x_data.append(elapsed)
+                            csi_y_data.append(mag0)
+
+                            if len(csi_x_data) > MAX_POINTS:
+                                csi_x_data = csi_x_data[-MAX_POINTS:]
+                                csi_y_data = csi_y_data[-MAX_POINTS:]
+
+                            self.csi_line.set_xdata(csi_x_data)
+                            self.csi_line.set_ydata(csi_y_data)
                             self.csi_ax.relim()
                             self.csi_ax.autoscale_view()
                             self.csi_canvas.draw()
@@ -256,7 +288,6 @@ class MainApp(tk.Tk):
         self.timer_label.config(text="Time Remaining: 0s")
         self.collect_msg.config(text=f"Saved {rows} subcarrier rows → {fname}", foreground="green")
         self.collect_btn.config(state="normal")
-
 
 
     def _do_collection_wrapper(self, label, duration):
@@ -414,24 +445,61 @@ class MainApp(tk.Tk):
         self.pred_label = ttk.Label(parent, text="Waiting...", font=("Helvetica", 36))
         self.pred_label.pack(pady=50)
 
+    # def _start_pred(self):
+    #     if not (self.pca and self.model and self.label_encoder):
+    #         messagebox.showerror("Model Missing", "Please train a model first.")
+    #         return
+    #     self._stop_pred.clear()
+    #     threading.Thread(target=self._prediction_loop, daemon=True).start()
+
     def _start_pred(self):
-        if not (self.pca and self.model and self.label_encoder):
-            messagebox.showerror("Model Missing", "Please train a model first.")
-            return
+        if not self.model or not self.pca or not self.label_encoder or not self.scaler:
+            if not self._load_trained_model():
+                return
         self._stop_pred.clear()
         threading.Thread(target=self._prediction_loop, daemon=True).start()
 
+    # def _prediction_loop(self):
+    #     wifisignalz = self.chunk_size.get()
+    #     while not self._stop_pred.is_set():
+    #         try:
+    #             packets = rdpcap(PCAP_PATH)
+    #             wifisignal = np.array([len(p) for p in packets if p.haslayer(Dot11)])
+    #             if len(wifisignal) >= wifisignalz:
+    #                 window = wifisignal[-wifisignalz:].reshape(1, -1)
+    #                 feat = self.pca.transform(window)
+    #                 probs = self.model.predict(feat)[0]
+    #                 idx = np.argmax(probs)
+    #                 if probs[idx] >= self.pred_thresh.get():
+    #                     label = self.label_encoder.inverse_transform([idx])[0]
+    #                 else:
+    #                     label = "Uncertain"
+
+    #                 self.pred_label.config(text=f"{label} ({probs[idx]:.2f})")
+    #         except Exception as e:
+    #             print("Prediction error:", e)
+    #         time.sleep(1)
+
     def _prediction_loop(self):
         wifisignalz = self.chunk_size.get()
+
         while not self._stop_pred.is_set():
             try:
                 packets = rdpcap(PCAP_PATH)
-                wifisignal = np.array([len(p) for p in packets if p.haslayer(Dot11)])
-                if len(wifisignal) >= wifisignalz:
-                    window = wifisignal[-wifisignalz:].reshape(1, -1)
-                    feat = self.pca.transform(window)
-                    probs = self.model.predict(feat)[0]
+                rssi = np.array([len(p) for p in packets if p.haslayer(Dot11)])
+
+                if len(rssi) >= wifisignalz:
+                    window = rssi[-wifisignalz:].reshape(1, -1)
+                    window_scaled = self.scaler.transform(window)
+
+                    if self.pca:
+                        window_processed = self.pca.transform(window_scaled)
+                    else:
+                        window_processed = window_scaled
+
+                    probs = self.model.predict(window_processed)[0]
                     idx = np.argmax(probs)
+
                     if probs[idx] >= self.pred_thresh.get():
                         label = self.label_encoder.inverse_transform([idx])[0]
                     else:

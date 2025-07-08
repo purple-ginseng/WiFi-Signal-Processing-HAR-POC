@@ -1,7 +1,7 @@
 import pandas as pd
 import plotly.graph_objects as go
 
-CSV_FILE = "./csi_log.csv"
+CSV_FILE = "CSI_ESP32/csi_log.csv"
 MAX_PACKETS = 150
 LINE_WIDTH = 2
 

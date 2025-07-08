@@ -24,6 +24,7 @@ from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 import seaborn as sns
 import json
+import joblib
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -122,7 +123,7 @@ def load_data():
     return X, y, le
 
 # --- Training and Evaluation ---
-def train_and_evaluate(X, y, le):
+def def train_and_evaluate(X, y, le):
     logger.info(f"GPUs available: {torch.cuda.device_count()}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     writer = SummaryWriter(log_dir=f"runs/{RUN_NAME}")
@@ -133,6 +134,11 @@ def train_and_evaluate(X, y, le):
 
     class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y), y=y)
     class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+
+    best_overall_val_loss = float("inf")
+    best_model_path = None
+    best_scaler = None
+    best_pca = None
 
     for train_idx, val_idx in skf.split(X, y):
         fold += 1
@@ -149,6 +155,8 @@ def train_and_evaluate(X, y, le):
             pca = PCA(n_components=PCA_COMPONENTS)
             X_train = pca.fit_transform(X_train)
             X_val = pca.transform(X_val)
+        else:
+            pca = None
 
         X_train = torch.tensor(X_train, dtype=torch.float32)
         X_val = torch.tensor(X_val, dtype=torch.float32)
@@ -167,7 +175,7 @@ def train_and_evaluate(X, y, le):
         criterion = nn.CrossEntropyLoss(label_smoothing=0.1, weight=class_weights)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-        scaler = torch.cuda.amp.GradScaler()
+        scaler_amp = torch.cuda.amp.GradScaler()
 
         best_val_loss = float("inf")
         patience = EARLY_STOPPING_PATIENCE
@@ -182,9 +190,9 @@ def train_and_evaluate(X, y, le):
                 with torch.cuda.amp.autocast():
                     preds = model(xb)
                     loss = criterion(preds, yb)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
+                scaler_amp.scale(loss).backward()
+                scaler_amp.step(optimizer)
+                scaler_amp.update()
                 running_loss += loss.item()
 
             train_loss = running_loss / len(train_loader)
@@ -216,14 +224,23 @@ def train_and_evaluate(X, y, le):
 
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                torch.save(model.state_dict(), f"{MODEL_PATH.replace('.pt', f'_fold{fold}.pt')}")
+                fold_model_path = f"{MODEL_PATH.replace('.pt', f'_fold{fold}.pt')}"
+                torch.save(model.state_dict(), fold_model_path)
                 patience = EARLY_STOPPING_PATIENCE
+
+                # Track best across folds
+                if val_loss < best_overall_val_loss:
+                    best_overall_val_loss = val_loss
+                    best_model_path = fold_model_path
+                    best_scaler = scaler
+                    best_pca = pca
             else:
                 patience -= 1
                 if patience == 0:
                     logger.info("Early stopping triggered.")
                     break
 
+        # Save per-fold metrics
         cm = confusion_matrix(y_true, y_preds)
         cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
         fig, ax = plt.subplots(figsize=(10, 8))
@@ -242,6 +259,17 @@ def train_and_evaluate(X, y, le):
 
     with open("summary_metrics.json", "w") as f:
         json.dump(all_metrics, f, indent=2)
+
+    # --- Save Final Artifacts for GUI Inference ---
+    if best_model_path:
+        logger.info(f"Copying best model {best_model_path} → {MODEL_PATH}")
+        import shutil
+        shutil.copy(best_model_path, MODEL_PATH)
+        if best_scaler:
+            joblib.dump(best_scaler, "scaler_torch.pkl")
+        if best_pca:
+            joblib.dump(best_pca, "pca_torch.pkl")
+        joblib.dump(le, "label_encoder_torch.pkl")
 
     writer.close()
 
