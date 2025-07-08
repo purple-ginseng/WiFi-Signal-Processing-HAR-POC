@@ -123,7 +123,7 @@ def load_data():
     return X, y, le
 
 # --- Training and Evaluation ---
-def def train_and_evaluate(X, y, le):
+def train_and_evaluate(X, y, le):
     logger.info(f"GPUs available: {torch.cuda.device_count()}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     writer = SummaryWriter(log_dir=f"runs/{RUN_NAME}")
