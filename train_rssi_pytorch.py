@@ -47,7 +47,7 @@ class CNNLSTMModel(nn.Module):
         self.conv1 = nn.Conv1d(1, 64, kernel_size=3)
         self.bn1 = nn.BatchNorm1d(64)
         self.pool = nn.MaxPool1d(2)
-        self.dropout1 = nn.Dropout(0.3)
+        self.dropout1 = nn.Dropout(0.3) # hardcoded for testing trainng
         self.lstm = nn.LSTM(
             input_size=64,
             hidden_size=256,
@@ -56,8 +56,8 @@ class CNNLSTMModel(nn.Module):
             dropout=0.2,
             bidirectional=True
         )
-        self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(256 * 2, 64)
+        self.dropout2 = nn.Dropout(0.5) # second dropouts
+        self.fc1 = nn.Linear(256 * 2, 64) 
         self.dropout3 = nn.Dropout(0.6)
         self.fc2 = nn.Linear(64, num_classes)
 
