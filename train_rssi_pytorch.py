@@ -47,7 +47,7 @@ class CNNLSTMModel(nn.Module):
         self.conv1 = nn.Conv1d(1, 64, kernel_size=3)
         self.bn1 = nn.BatchNorm1d(64)
         self.pool = nn.MaxPool1d(2)
-        self.dropout1 = nn.Dropout(0.3) # hardcoded for testing trainng
+        self.dropout1 = nn.Dropout(0.5) # hardcoded for testing trainng
         self.lstm = nn.LSTM(
             input_size=64,
             hidden_size=256,
@@ -56,9 +56,9 @@ class CNNLSTMModel(nn.Module):
             dropout=0.2,
             bidirectional=True
         )
-        self.dropout2 = nn.Dropout(0.5) # second dropouts
+        self.dropout2 = nn.Dropout(0.3) # second dropouts
         self.fc1 = nn.Linear(256 * 2, 64) 
-        self.dropout3 = nn.Dropout(0.6)
+        self.dropout3 = nn.Dropout(0.4)
         self.fc2 = nn.Linear(64, num_classes)
 
     def forward(self, x):
@@ -163,8 +163,8 @@ def train_and_evaluate(X, y, le):
         y_train = torch.tensor(y_train, dtype=torch.long)
         y_val = torch.tensor(y_val, dtype=torch.long)
 
-        train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True)
-        val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=BATCH_SIZE)
+        train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True,num_workers=8, pin_memory=True, persistent_workers=True)
+        val_loader = DataLoader(TensorDataset(X_val, y_val), batch_size=BATCH_SIZE,num_workers=8, pin_memory=True, persistent_workers=True)
 
         model = CNNLSTMModel(input_size=X_train.shape[1], num_classes=len(le.classes_))
         if torch.cuda.device_count() > 1:

@@ -4,7 +4,7 @@ import glob
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import spectrogram
+from scipy.signal import spectrogram, detrend, hilbert
 from scipy.ndimage import gaussian_filter
 import torch
 import torch.nn.functional as F
@@ -54,6 +54,81 @@ def draw_attention(attn_matrix):
     cax = ax.imshow(attn_matrix, cmap='viridis')
     ax.set_title("Attention Matrix")
     fig.colorbar(cax)
+    return fig
+
+def draw_motion_analysis(signal, fs=200, cmap="viridis"):
+    """Enhanced motion analysis for RSSI signals"""
+    
+    # Detrend signal
+    signal_detrended = detrend(signal)
+    
+    # Compute analytic signal for instantaneous frequency analysis
+    analytic_signal = hilbert(signal_detrended)
+    instantaneous_phase = np.unwrap(np.angle(analytic_signal))
+    instantaneous_freq = np.diff(instantaneous_phase) / (2.0 * np.pi) * fs
+    
+    # Motion activity indicator (signal variance in sliding windows)
+    window_size = int(fs * 0.5)  # 0.5 second windows
+    stride = window_size // 4
+    activity_indicator = []
+    time_windows = []
+    
+    for i in range(0, len(signal) - window_size, stride):
+        window = signal[i:i + window_size]
+        activity_indicator.append(np.var(window))
+        time_windows.append((i + window_size//2) / fs)
+    
+    # Doppler-like analysis (FFT of signal variations)
+    window = np.hanning(len(signal_detrended))
+    windowed_signal = signal_detrended * window
+    fft_result = np.fft.fftshift(np.fft.fft(windowed_signal))
+    freqs = np.fft.fftshift(np.fft.fftfreq(len(signal), 1/fs))
+    power_spectrum = np.abs(fft_result) ** 2
+    
+    # Create 2x2 subplot layout
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 8))
+    
+    # 1. Motion Activity Indicator
+    ax1.plot(time_windows, activity_indicator, 'purple', linewidth=2)
+    ax1.set_title("Motion Activity (Signal Variance)")
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel("Variance")
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Instantaneous Frequency
+    time_axis = np.arange(len(instantaneous_freq)) / fs
+    ax2.plot(time_axis, instantaneous_freq, 'orange', linewidth=1)
+    ax2.set_title("Instantaneous Frequency")
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Frequency (Hz)")
+    ax2.grid(True, alpha=0.3)
+    ax2.set_ylim(-50, 50)  # Focus on relevant frequency range
+    
+    # 3. Power Spectrum (Motion Detection)
+    ax3.plot(freqs, 10*np.log10(power_spectrum + 1e-10), 'blue', linewidth=2)
+    ax3.set_title("Power Spectrum (Motion Detection)")
+    ax3.set_xlabel("Frequency (Hz)")
+    ax3.set_ylabel("Power (dB)")
+    ax3.grid(True, alpha=0.3)
+    ax3.axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    ax3.set_xlim(-10, 10)  # Focus on motion-relevant frequencies
+    
+    # 4. Spectrogram with motion overlay
+    f_spec, t_spec, Sxx = spectrogram(signal_detrended, fs=fs, nperseg=64, noverlap=32)
+    im = ax4.pcolormesh(t_spec, f_spec, 10*np.log10(Sxx + 1e-10), cmap=cmap)
+    ax4.set_title("Spectrogram with Motion Events")
+    ax4.set_xlabel("Time (s)")
+    ax4.set_ylabel("Frequency (Hz)")
+    ax4.set_ylim(0, 20)  # Focus on low frequencies for motion
+    
+    # Overlay motion events (high activity periods)
+    activity_threshold = np.percentile(activity_indicator, 75)
+    motion_times = [t for t, a in zip(time_windows, activity_indicator) if a > activity_threshold]
+    for t in motion_times:
+        ax4.axvline(x=t, color='red', alpha=0.3, linewidth=2)
+    
+    fig.colorbar(im, ax=ax4, label="Power (dB)")
+    plt.tight_layout()
     return fig
 
 # --- UI ---
@@ -125,6 +200,10 @@ with col1:
 with col2:
     attn = compute_attention(signal)
     st.pyplot(draw_attention(attn))
+
+# --- Enhanced Motion Analysis ---
+st.markdown("### 🏃 Enhanced Motion Analysis")
+st.pyplot(draw_motion_analysis(signal, fs=FS, cmap=cmap))
 
 # --- Advance frame
 st.session_state.row_index += 1

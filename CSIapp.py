@@ -4,7 +4,7 @@ import glob
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.signal import spectrogram
+from scipy.signal import spectrogram, detrend
 from scipy.ndimage import gaussian_filter
 import torch
 import torch.nn.functional as F
@@ -51,17 +51,74 @@ def draw_heatmap(matrix, cmap, title="CSI Heatmap"):
     fig.colorbar(cax, ax=ax, label="Magnitude")
     return fig
 
-def draw_doppler_phase_fft(complex_matrix, cmap):
-    phase_signal = np.unwrap(np.angle(complex_matrix), axis=0)
-    fft_matrix = np.fft.fftshift(np.fft.fft(phase_signal, axis=0), axes=0)
-    power = np.abs(fft_matrix) ** 2
-
-    fig, ax = plt.subplots(figsize=(10, 4))
-    cax = ax.imshow(power.T, aspect='auto', cmap=cmap, origin='lower')
-    ax.set_title("Doppler View (Phase FFT per Subcarrier)")
-    ax.set_xlabel("Frequency Bin")
-    ax.set_ylabel("Subcarrier Index")
-    fig.colorbar(cax, ax=ax, label="Power")
+def draw_doppler_analysis(complex_matrix, cmap, fs=30.0):
+    """Enhanced Doppler analysis with multiple insights"""
+    
+    # Method 1: Coherent averaging across subcarriers
+    # Weight by magnitude to emphasize strong subcarriers
+    magnitudes = np.abs(complex_matrix)
+    weights = magnitudes / (np.sum(magnitudes, axis=1, keepdims=True) + 1e-10)
+    coherent_signal = np.sum(complex_matrix * weights, axis=1)
+    coherent_phase = np.unwrap(np.angle(coherent_signal))
+    
+    # Method 2: Select best subcarriers (highest average magnitude)
+    avg_mag_per_subcarrier = np.mean(magnitudes, axis=0)
+    best_subcarriers = np.argsort(avg_mag_per_subcarrier)[-5:]  # Top 5 subcarriers
+    selected_signal = np.mean(complex_matrix[:, best_subcarriers], axis=1)
+    selected_phase = np.unwrap(np.angle(selected_signal))
+    
+    # Method 3: Differential phase analysis (subcarrier diversity)
+    phase_matrix = np.unwrap(np.angle(complex_matrix), axis=0)
+    phase_variance = np.var(phase_matrix, axis=1)  # Variance across subcarriers
+    
+    # Create subplot layout
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 8))
+    
+    # 1. Coherent Doppler Spectrum
+    coherent_detrended = detrend(coherent_phase)
+    window = np.hanning(len(coherent_detrended))
+    windowed = coherent_detrended * window
+    fft_coherent = np.fft.fftshift(np.fft.fft(windowed))
+    power_coherent = np.abs(fft_coherent) ** 2
+    freqs = np.fft.fftshift(np.fft.fftfreq(len(coherent_phase), 1/fs))
+    
+    ax1.plot(freqs, 10*np.log10(power_coherent + 1e-10), 'b-', linewidth=2)
+    ax1.set_title("Coherent Doppler Spectrum (Magnitude-Weighted)")
+    ax1.set_xlabel("Doppler Frequency (Hz)")
+    ax1.set_ylabel("Power (dB)")
+    ax1.grid(True, alpha=0.3)
+    ax1.axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    
+    # 2. Best Subcarriers Doppler Spectrum  
+    selected_detrended = detrend(selected_phase)
+    windowed_selected = selected_detrended * window
+    fft_selected = np.fft.fftshift(np.fft.fft(windowed_selected))
+    power_selected = np.abs(fft_selected) ** 2
+    
+    ax2.plot(freqs, 10*np.log10(power_selected + 1e-10), 'g-', linewidth=2)
+    ax2.set_title("Top 5 Subcarriers Doppler Spectrum")
+    ax2.set_xlabel("Doppler Frequency (Hz)")
+    ax2.set_ylabel("Power (dB)")
+    ax2.grid(True, alpha=0.3)
+    ax2.axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    
+    # 3. Phase Variance (Motion Activity Indicator)
+    time_axis = np.arange(len(phase_variance)) / fs
+    ax3.plot(time_axis, phase_variance, 'purple', linewidth=2)
+    ax3.set_title("Phase Variance Across Subcarriers (Motion Activity)")
+    ax3.set_xlabel("Time (s)")
+    ax3.set_ylabel("Phase Variance (rad²)")
+    ax3.grid(True, alpha=0.3)
+    
+    # 4. Spectrogram of coherent signal
+    f_spec, t_spec, Sxx = spectrogram(coherent_detrended, fs=fs, nperseg=min(64, len(coherent_detrended)//4))
+    im = ax4.pcolormesh(t_spec, f_spec, 10*np.log10(Sxx + 1e-10), cmap=cmap)
+    ax4.set_title("Coherent Signal Spectrogram")
+    ax4.set_xlabel("Time (s)")
+    ax4.set_ylabel("Frequency (Hz)")
+    fig.colorbar(im, ax=ax4, label="Power (dB)")
+    
+    plt.tight_layout()
     return fig
 
 # --- Streamlit App ---
@@ -90,11 +147,33 @@ df["Q"] = pd.to_numeric(df["Q"], errors="coerce")
 df["magnitude"] = pd.to_numeric(df["magnitude"], errors="coerce")
 df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
 
-# Build complex CSI values
-df["csi_complex"] = df["I"] + 1j * df["Q"]
+# Remove rows with NaN values to reduce memory usage
+df = df.dropna()
 
-mag_pivot = df.pivot(index="timestamp", columns="subcarrier_index", values="magnitude")
-complex_pivot = df.pivot(index="timestamp", columns="subcarrier_index", values="csi_complex")
+# Ensure proper data types
+df["timestamp"] = df["timestamp"].astype(float)
+df["subcarrier_index"] = df["subcarrier_index"].astype(int)
+df["magnitude"] = df["magnitude"].astype(float)
+df["I"] = df["I"].astype(float)
+df["Q"] = df["Q"].astype(float)
+
+# Sample data if too large (keep every Nth row to reduce memory usage)
+if len(df) > 50000:
+    sample_rate = len(df) // 50000
+    df = df.iloc[::sample_rate]
+
+try:
+    # Pivot magnitude, I, and Q separately to avoid complex number issues
+    mag_pivot = df.pivot_table(index="timestamp", columns="subcarrier_index", values="magnitude", aggfunc='mean')
+    I_pivot = df.pivot_table(index="timestamp", columns="subcarrier_index", values="I", aggfunc='mean')
+    Q_pivot = df.pivot_table(index="timestamp", columns="subcarrier_index", values="Q", aggfunc='mean')
+    
+    # Reconstruct complex values after pivoting
+    complex_pivot = I_pivot + 1j * Q_pivot
+    
+except Exception as e:
+    st.error(f"Pivot operation failed. Error: {str(e)[:100]}")
+    st.stop()
 
 mag_pivot = mag_pivot.sort_index().dropna()
 complex_pivot = complex_pivot.sort_index().dropna()
@@ -141,8 +220,8 @@ with col2:
 st.markdown("### 🔍 CSI Subcarrier Magnitude Heatmap")
 st.pyplot(draw_heatmap(mag_window.T.values, cmap=cmap, title="Subcarrier vs Time (Magnitude)"))
 
-st.markdown("### 🔁 Doppler Phase FFT View (per Subcarrier)")
-st.pyplot(draw_doppler_phase_fft(complex_window.values, cmap=cmap))
+st.markdown("### 🔁 Enhanced Doppler Analysis")
+st.pyplot(draw_doppler_analysis(complex_window.values, cmap=cmap))
 
 st.session_state.row_index += 1
 time.sleep(1 / 30)
