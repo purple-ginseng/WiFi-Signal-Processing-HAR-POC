@@ -30,6 +30,12 @@ matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
+from bfmtool.collector import BFMCollector
+from bfmtool.extractor import BFMExtractor
+from bfmtool.preprocessor import BFMPreprocessor
+
+from functools import partial
+
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 DATA_DIR      = './data'
 PCAP_PATH     = './data/wifisignal.pcap'
@@ -57,14 +63,28 @@ class MainApp(tk.Tk):
         self._stop_pcap_transfer = threading.Event()
 
         self.source_mode = tk.StringVar(value="RSSI-PCAP")
-        self._stop_csi = threading.Event()
+        self._stop_csi = threading.Event() 
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # BFM Settings
+        self.bfm_is_setup = False
+        self.bfm_collector = None
+        self.bfm_extractor = None
+        self.bfm_preprocessor = None
+        self.bfm_collected = set()
+        self.bfm_extracted = set()
+        self.bfm_processed = set()
+
     def _on_close(self):
         self._stop_csi.set()
         self._stop_pcap_transfer_loop()
+
+        # bfm close connection
+        if self.bfm_collector is not None:
+            self._toggle_bfm_setup()
+
         self.destroy()
 
     def _load_trained_model(self):
@@ -145,8 +165,11 @@ class MainApp(tk.Tk):
         src_row = ttk.Frame(parent)
         src_row.pack(fill="x", pady=(10,0))
         ttk.Label(src_row, text="Source:").pack(side="left")
-        src_menu = ttk.OptionMenu(src_row, self.source_mode, self.source_mode.get(), "RSSI-PCAP", "CSI-UDP")
+        src_menu = ttk.OptionMenu(src_row, self.source_mode, self.source_mode.get(), "RSSI-PCAP", "CSI-UDP", "BFM-PCAP")
         src_menu.pack(side="left", padx=5)
+
+        self.bfm_setup_btn = ttk.Button(parent, text="Setup BFM", command=self._toggle_bfm_setup)
+        self.bfm_setup_btn.pack(pady=5)
 
         ttk.Label(parent, text="Label for this session:").pack(anchor="w", pady=(10,0))
         self.collect_label = ttk.Entry(parent)
@@ -193,13 +216,123 @@ class MainApp(tk.Tk):
             self.collect_msg.config(text="Collecting RSSI via PCAP…", foreground="blue")
             self._start_pcap_transfer()
             target_fn = self._do_collection_wrapper
-        else:
+        elif self.source_mode.get() == "CSI-UDP":
             self.collect_msg.config(text="Collecting CSI via UDP…", foreground="blue")
             self._stop_csi.clear()
             target_fn = self._do_csi_collection
-
+        elif self.source_mode.get() == "BFM-PCAP":
+            self.collect_msg.config(text="Collecting BFM...", foreground="blue")
+            target_fn = self._do_bfm_collection 
+        
         self.collect_btn.config(state="disabled")
         threading.Thread(target=target_fn, args=(lbl, duration), daemon=True).start()
+
+    def _do_bfm_collection(self, label, duration):
+        # --- Component 1: Initialization ---
+        try:
+
+            self.bfm_collector.run_tcpdump()
+            self.bfm_collector.filename = partial(self.generate_bfm_filename, label)
+            start_ts = time.time()
+            self.progress.config(maximum=duration) # Set the progress bar's max value
+
+            
+            
+            while time.time() - start_ts < duration:
+                elapsed = time.time() - start_ts
+                self.progress['value'] = elapsed
+                self.timer_label.config(text=f"Time Remaining: {max(duration - int(elapsed), 0)}s")
+                time.sleep(0.1) 
+            
+
+        except Exception as e:
+            # It's good practice to catch errors from your modules
+
+            if self.bfm_collector is None:
+                e = "Please click 'Setup BFM'"    
+
+            self.collect_msg.config(text=f"Error: {e}", foreground="red")
+            print(f"[BFM ERROR] {e}")
+
+        finally:
+            # --- Component 3: Cleanup and GUI Reset ---
+            # This block runs regardless of whether an error occurred or not.
+            if self.bfm_collector is not None:
+                self.bfm_collector.kill_tcpdump()
+
+                to_be_extracted = self.bfm_collector.get_collected_files() - self.bfm_collected
+                self.bfm_extractor.extract(to_be_extracted)
+
+                to_be_processed = self.bfm_extractor.get_extracted_files() - self.bfm_extracted
+                self.bfm_preprocessor.process(to_be_processed)
+                
+                self.bfm_collected.update(self.bfm_collector.get_collected_files())
+                self.bfm_extracted.update(self.bfm_extractor.get_extracted_files())
+
+            self.progress['value'] = 0
+            self.timer_label.config(text="Time Remaining: 0s")
+            self.collect_btn.config(state="normal") # Re-enable the button
+            self.collect_msg.config(text=f"[BFM] Collection finished.")
+            print("[BFM] Collection finished.")
+
+    def _toggle_bfm_setup(self):
+        """
+        Handles the logic for the BFM setup/close toggle button.
+        """
+        # --- STATE 1: BFM is currently NOT set up ---
+        if not self.bfm_is_setup:
+            print("[BFM] Button clicked. Current state: DISCONNECTED. Attempting to set up...")
+            try:
+                # BFM Settings
+                self.bfm_collector = BFMCollector(
+                    host = '192.168.1.1',
+                    username = 'root',
+                    password = '123456',
+                    local_pcap_dir = 'bfm_pcap',
+                )
+                self.bfm_extractor = BFMExtractor(
+                    tshark_path = r'C:\Program Files\Wireshark\tshark.exe',
+                    csv_dir = 'bfm_raw_csv'
+                )
+                self.bfm_preprocessor = BFMPreprocessor(
+                    dir = 'bfm_processed_csv'
+                )
+
+                self.bfm_collector.connect()
+                self.bfm_collector.run_iperf3()
+
+
+                # --- If your logic succeeds, update the state and UI ---
+                self.bfm_is_setup = True
+                self.bfm_setup_btn.config(text="Close BFM")
+                self.collect_msg.config(text="BFM connection established.", foreground="blue")
+                print("[BFM] ✅ SETUP succeeded.")
+
+            except Exception as e:
+                # --- If your logic fails, show an error ---
+                messagebox.showerror(f"BFM Setup Failed\n{e}")
+                print(f"[BFM ERROR] Custom setup failed: {e}")
+
+        # --- STATE 2: BFM is currently SET UP ---
+        else:
+            print("[BFM] Button clicked. Current state: CONNECTED. Attempting to close...")
+            try:
+                self.bfm_collector.kill_iperf3()
+                self.bfm_collector.close()
+
+                self.bfm_collector = None
+                self.bfm_extractor = None
+                self.bfm_preprocessor = None
+
+                # --- If your logic succeeds, update the state and UI ---
+                self.bfm_is_setup = False
+                self.bfm_setup_btn.config(text="Setup BFM")
+                self.collect_msg.config(text="BFM connection closed.", foreground="black")
+                print("[BFM] ✅ Placeholder logic for CLOSE succeeded.")
+
+            except Exception as e:
+                messagebox.showerror(f"BFM Close Error\n{e}")
+                print(f"[BFM ERROR]: {e}")
 
     def _do_csi_collection(self, label, duration, ip="0.0.0.0", port=12345):
         import math
@@ -348,6 +481,11 @@ class MainApp(tk.Tk):
         except Exception as e:
             print("Failed to parse wifisignal:", e)
             return None
+        
+    def generate_bfm_filename(self, label):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        return f"bfm_data_{label}_{timestamp}.pcap"
 
     def _build_training_ui(self, parent):
         self.train_btn = ttk.Button(parent, text="Start Training", command=self._on_train)
