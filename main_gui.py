@@ -43,6 +43,7 @@ PCA_COMPONENTS= 50
 TEST_SIZE     = 0.3
 EPOCHS        = 20
 BATCH_SIZE_TF = 32
+TSHARK_PATH = r'C:\Program Files\Wireshark\tshark.exe'
 # ───────────────────────────────────────────────────────────────────────────────
 
 class MainApp(tk.Tk):
@@ -291,7 +292,7 @@ class MainApp(tk.Tk):
                     local_pcap_dir = 'bfm_pcap',
                 )
                 self.bfm_extractor = BFMExtractor(
-                    tshark_path = r'C:\Program Files\Wireshark\tshark.exe',
+                    tshark_path = TSHARK_PATH,
                     csv_dir = 'bfm_raw_csv'
                 )
                 self.bfm_preprocessor = BFMPreprocessor(
