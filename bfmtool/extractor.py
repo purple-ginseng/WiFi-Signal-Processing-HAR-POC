@@ -51,44 +51,65 @@ def clean_from_ansi(s : str):
     s = ansi_escape_pattern.sub('', s)
     return s
 
-def parse_bfm(bfm_report: str):
+def parse_bfm_report(bfm_report: str):
     """
-    Parses a verbose packet dissection to find the Epoch Time and BFM report.
-    Handles variations in the timestamp format.
+    Parses a verbose packet dissection to find the Epoch Time, MAC addresses,
+    and the BFM report data using a resilient parsing strategy.
+
+    It prioritizes finding MAC addresses within parentheses but falls back to
+    finding the last MAC address on a line if parentheses are not present.
 
     Returns:
-        tuple: A tuple containing (timestamp_str, list_of_bfm_dicts).
-               Returns (None, []) if data is not found.
+        dict: A dictionary containing the parsed data with keys:
+              'timestamp', 'mac_addresses', and 'feedback_matrices'.
     """
-    # Regex for BFM lines (unchanged)
-    bfm_regex = re.compile(r"SCIDX:\s*(-?\d+),\s*φ11:\s*(\d+),\s*ψ21:\s*(\d+)")
-    
-    # --- UPDATED: More flexible regex for the timestamp ---
+    # Unchanged regex patterns for timestamp and BFM data
     timestamp_regex = re.compile(r"Epoch (?:Arrival )?Time:\s*(\d+\.\d+)")
-    
-    parsed_feedback_matrices = []
+    bfm_regex = re.compile(r"SCIDX:\s*(-?\d+),\s*φ11:\s*(\d+),\s*ψ21:\s*(\d+)")
+
+    # --- UPDATED: A more robust MAC address regex ---
+    # This pattern attempts to find a MAC in parentheses first. If that fails,
+    # it falls back to finding the last valid MAC address at the end of the line.
+    mac_regex = re.compile(
+        r"^(?P<label>(?:Receiver|Destination|Transmitter|Source) address):.*?"
+        r"(?:\((?P<mac_paren>(?:[a-fA-F0-9]{2}:){5}[a-fA-F0-9]{2})\)|(?P<mac_last>(?:[a-fA-F0-9]{2}:){5}[a-fA-F0-9]{2}))$"
+    )
+
+    # Initialize containers
     timestamp = None
+    mac_addresses = {}
+    parsed_feedback_matrices = []
     
     for line in bfm_report.splitlines():
-        # Search for the timestamp on each line
-        if not timestamp: # Only find the first timestamp
+        # --- 1. Search for the timestamp (no change) ---
+        if not timestamp:
             ts_match = timestamp_regex.search(line)
             if ts_match:
                 timestamp = ts_match.group(1)
         
-        # Search for BFM data
+        # --- 2. Search for MAC Addresses with the new, resilient regex ---
+        mac_match = mac_regex.search(line.strip())
+        if mac_match:
+            key = mac_match.group('label').lower().replace(' ', '_')
+            # Prioritize the parenthesized MAC, otherwise use the fallback.
+            mac_address = mac_match.group('mac_paren') or mac_match.group('mac_last')
+            mac_addresses[key] = mac_address
+
+        # --- 3. Search for BFM data (no change) ---
         bfm_match = bfm_regex.search(line.strip())
         if bfm_match:
-            scidx = int(bfm_match.group(1))
-            phi11 = int(bfm_match.group(2))
-            psi21 = int(bfm_match.group(3))
             parsed_feedback_matrices.append({
-                "SCIDX": scidx,
-                "phi11": phi11,
-                "psi21": psi21
+                "SCIDX": int(bfm_match.group(1)),
+                "phi11": int(bfm_match.group(2)),
+                "psi21": int(bfm_match.group(3))
             })
             
-    return timestamp, parsed_feedback_matrices
+    return {
+        "timestamp": timestamp,
+        "mac_addresses": mac_addresses,
+        "feedback_matrices": parsed_feedback_matrices
+    }   
+
 
 def parsed_bfm_to_list(bfm : List[Dict]):
     """
@@ -217,6 +238,7 @@ class BFMExtractor:
         columns = []
         # --- NEW: A list to hold our timestamps ---
         timestamps_list = []
+        mac_address_list = []
         
         try:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, encoding='utf-8')
@@ -226,8 +248,12 @@ class BFMExtractor:
                 bfm_report = clean_from_ansi(bfm_report)
                 
                 # --- NEW: Unpack the tuple returned by the updated function ---
-                timestamp, parsed_bfm = parse_bfm(bfm_report)
                 
+                parsed_data = parse_bfm_report(bfm_report)
+                timestamp, parsed_bfm = parsed_data['timestamp'], parsed_data['feedback_matrices']
+                mac_addresses = parsed_data['mac_addresses']
+
+
                 # We need both a timestamp and BFM data to proceed
                 if not parsed_bfm or not timestamp:
                     continue
@@ -236,6 +262,8 @@ class BFMExtractor:
                 timestamps_list.append(timestamp)
                 
                 data_for_df.append(parsed_bfm_to_list(parsed_bfm))
+
+                mac_address_list.append(mac_addresses)
                 
                 if not columns:
                     for subcarrier in parsed_bfm:
@@ -257,7 +285,9 @@ class BFMExtractor:
         df = pd.DataFrame(data=data_for_df, columns=columns)
         
         # --- NEW: Insert the timestamp column at the beginning of the DataFrame ---
+        df = pd.concat((pd.DataFrame(mac_address_list), df), axis = 1)
         df.insert(0, 'timestamp', timestamps_list)
+
         
         df.to_csv(csv_path, index=False)
         self._extracted_files.add(csv_path)
@@ -270,7 +300,7 @@ class BFMExtractor:
             self.pcap_to_csv(file, self.csv_dir / (file.name[:-5] + '.csv'))
 
 if __name__  == '__main__':
-    files = [r'bfm_pcap\bfm0.pcap', r'bfm_pcap\bfm1.pcap']
-    extractor = BFMExtractor(tshark_path= r"C:\Program Files\Wireshark\tshark.exe", csv_dir= 'bfm_csv')
+    files = [r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_bediri_20251008_115846.pcap"]
+    extractor = BFMExtractor(tshark_path= r"C:\Program Files\Wireshark\tshark.exe", csv_dir= 'bfm_raw_csv')
     extractor.extract(files)
     print(extractor.get_extracted_files())

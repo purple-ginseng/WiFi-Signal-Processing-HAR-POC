@@ -54,6 +54,7 @@ def process_bfm_dataframe(df):
     phi_cols = [f'SCIDX_{scidx}_phi11' for scidx in subcarrier_indices]
     psi_cols = [f'SCIDX_{scidx}_psi21' for scidx in subcarrier_indices]
 
+
     # Extract all data into NumPy arrays in one go. No loops!
     phi_values = df[phi_cols].values # Shape: (num_rows, num_subcarriers)
     psi_values = df[psi_cols].values # Shape: (num_rows, num_subcarriers)
@@ -87,7 +88,11 @@ def process_bfm_dataframe(df):
     final_data[:, 1::2] = bfm_ratio.imag
     
     ratio_df = pd.DataFrame(final_data, columns=columns)
-    
+
+    # add back columns
+    other_cols = [col for col in df.columns if col not in phi_cols + psi_cols]
+    ratio_df = pd.concat((df[other_cols], ratio_df), axis = 1)
+
     return ratio_df
 
 
@@ -111,8 +116,9 @@ class BFMPreprocessor():
 
 
 if __name__ == '__main__':
-    preprocessor = BFMPreprocessor(dir = 'bfm_processed')
-    preprocessor.process([r'bfm_csv\bfm0.csv', r'bfm_csv\bfm1.csv'])
+    preprocessor = BFMPreprocessor(dir = 'bfm_processed_csv')
+    preprocessor.process([r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_bediri_20251008_115846.csv"])
+    
 
     
 
