@@ -117,7 +117,27 @@ class BFMPreprocessor():
 
 if __name__ == '__main__':
     preprocessor = BFMPreprocessor(dir = 'bfm_processed_csv')
-    preprocessor.process([r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_bediri_20251008_115846.csv"])
+    files = [r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_walking_ivan_alt_nofoil_20251009_184305.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_walking_ivan_alt_nofoil_20251009_184644.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_walking_kenny_alt_nofoil_20251009_181204.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_walking_kenny_alt_nofoil_20251009_181639.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_walking_kenny_alt_nofoil_20251009_182007.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_walking_kenny_alt_nofoil_20251009_182338.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_walking_kenny_alt_nofoil_20251009_182705.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_standing_ivan_alt_nofoil_20251009_183050.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_standing_ivan_alt_nofoil_20251009_183419.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_standing_ivan_alt_nofoil_20251009_183754.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_standing_ivan_alt_nofoil_20251009_184118.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_standing_ivan_alt_nofoil_20251009_184449.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_standing_kenny_alt_nofoil_20251009_180944.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_standing_kenny_alt_nofoil_20251009_181349.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_standing_kenny_alt_nofoil_20251009_181824.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_standing_kenny_alt_nofoil_20251009_182155.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_standing_kenny_alt_nofoil_20251009_182522.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_walking_ivan_alt_nofoil_20251009_183235.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_walking_ivan_alt_nofoil_20251009_183604.csv",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_raw_csv\bfm_data_walking_ivan_alt_nofoil_20251009_183936.csv"]
+    preprocessor.process(files)
     
 
     

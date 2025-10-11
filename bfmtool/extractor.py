@@ -300,7 +300,26 @@ class BFMExtractor:
             self.pcap_to_csv(file, self.csv_dir / (file.name[:-5] + '.csv'))
 
 if __name__  == '__main__':
-    files = [r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_bediri_20251008_115846.pcap"]
+    files = [r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_walking_ivan_alt_nofoil_20251009_184305.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_walking_ivan_alt_nofoil_20251009_184644.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_walking_kenny_alt_nofoil_20251009_181204.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_walking_kenny_alt_nofoil_20251009_181639.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_walking_kenny_alt_nofoil_20251009_182007.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_walking_kenny_alt_nofoil_20251009_182338.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_walking_kenny_alt_nofoil_20251009_182705.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_standing_ivan_alt_nofoil_20251009_183050.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_standing_ivan_alt_nofoil_20251009_183419.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_standing_ivan_alt_nofoil_20251009_183754.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_standing_ivan_alt_nofoil_20251009_184118.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_standing_ivan_alt_nofoil_20251009_184449.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_standing_kenny_alt_nofoil_20251009_180944.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_standing_kenny_alt_nofoil_20251009_181349.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_standing_kenny_alt_nofoil_20251009_181824.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_standing_kenny_alt_nofoil_20251009_182155.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_standing_kenny_alt_nofoil_20251009_182522.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_walking_ivan_alt_nofoil_20251009_183235.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_walking_ivan_alt_nofoil_20251009_183604.pcap",
+r"D:\Matthew\SelfStudy\csi-project\PG_project\5 October 2025\WiFi-Signal-Processing-HAR\bfm_pcap\bfm_data_walking_ivan_alt_nofoil_20251009_183936.pcap"]
     extractor = BFMExtractor(tshark_path= r"C:\Program Files\Wireshark\tshark.exe", csv_dir= 'bfm_raw_csv')
     extractor.extract(files)
     print(extractor.get_extracted_files())
