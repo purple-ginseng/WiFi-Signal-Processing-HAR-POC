@@ -20,9 +20,11 @@ def sorted_pkt_cols(df):
     pkt_cols = [c for c in df.columns if c.startswith("pkt")]
     return sorted(pkt_cols, key=lambda x: int(x[3:]))
 
-def compute_attention(seq):
-    x = torch.tensor(seq, dtype=torch.float32).unsqueeze(-1)
-    scores = torch.matmul(x, x.T) / np.sqrt(x.shape[0])
+def compute_attention(seq, downsample=10):
+    # Downsample to reduce computation (e.g., from 2000 to 200 samples)
+    seq_downsampled = seq[::downsample]
+    x = torch.tensor(seq_downsampled, dtype=torch.float32).unsqueeze(-1)
+    scores = torch.matmul(x, x.T) / np.sqrt(x.shape[-1])
     return F.softmax(scores, dim=-1).detach().numpy()
 
 def draw_waveform(signal, fs=200):
@@ -158,6 +160,11 @@ samples_per_row = len(pkt_cols)
 rows_needed = int(np.ceil(TARGET_LENGTH / samples_per_row))
 total_rows = len(df)
 
+# Validate sufficient rows available
+if total_rows < rows_needed:
+    st.error(f"Not enough rows in CSV. Need {rows_needed} rows, but only {total_rows} available.")
+    st.stop()
+
 cmap = st.sidebar.selectbox("🎨 Spectrogram Color Map", CMAPS)
 fmin, fmax = st.sidebar.slider("Spectrogram Y-Axis (Hz)", 0, int(FS//2), (0, 100))
 
@@ -169,9 +176,10 @@ start_idx = st.session_state.row_index
 end_idx = start_idx + rows_needed
 
 # Restart when not enough rows
-if end_idx >= total_rows:
+if end_idx > total_rows:
     st.warning("Reached end of data — restarting.")
     st.session_state.row_index = 0
+    time.sleep(0.5)  # Brief pause before restart
     st.rerun()
 
 # Get signal block
@@ -180,7 +188,15 @@ signal_matrix = window_df[pkt_cols].astype(float).values
 signal = signal_matrix.flatten()[:TARGET_LENGTH]
 
 # --- Validation ---
-label = window_df["label"].mode()[0] if "label" in window_df else "N/A"
+if "label" in window_df.columns:
+    try:
+        label_mode = window_df["label"].mode()
+        label = label_mode[0] if len(label_mode) > 0 else "N/A"
+    except:
+        label = "N/A"
+else:
+    label = "N/A"
+
 if np.isnan(signal).any():
     st.error("NaN values found in signal — check CSV integrity.")
     st.stop()
@@ -205,7 +221,22 @@ with col2:
 st.markdown("### 🏃 Enhanced Motion Analysis")
 st.pyplot(draw_motion_analysis(signal, fs=FS, cmap=cmap))
 
-# --- Advance frame
-st.session_state.row_index += 1
-time.sleep(1 / 30)
-st.rerun()
+# --- Auto-advance control
+auto_advance = st.sidebar.checkbox("🔄 Auto-advance frames", value=False)
+advance_fps = st.sidebar.slider("Auto-advance FPS", 1, 30, 10) if auto_advance else 10
+
+if auto_advance:
+    st.session_state.row_index += 1
+    time.sleep(1 / advance_fps)
+    st.rerun()
+else:
+    # Manual controls
+    col_prev, col_next = st.columns(2)
+    with col_prev:
+        if st.button("⬅️ Previous") and st.session_state.row_index > 0:
+            st.session_state.row_index -= 1
+            st.rerun()
+    with col_next:
+        if st.button("➡️ Next") and end_idx < total_rows:
+            st.session_state.row_index += 1
+            st.rerun()

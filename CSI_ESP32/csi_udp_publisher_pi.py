@@ -6,9 +6,9 @@ import os
 
 # === CONFIGURATION ===
 SERIAL_PORT = '/dev/ttyUSB0'
-BAUD_RATE = 115200
+BAUD_RATE = 115200  # Increased to match ESP32
 RECONNECT_DELAY = 5
-MAX_BUFFER_SIZE = 65536
+MAX_BUFFER_SIZE = 131072  # Doubled buffer size
 MAX_RECONNECT_ATTEMPTS = 3
 
 UDP_TARGET_IP = "192.168.3.4"  # <- replace with your receiver IP
@@ -83,83 +83,84 @@ def connect_serial():
     attempt = 0
     while True:
         try:
-            ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.05)
-            print(f"[INFO] Connected to {SERIAL_PORT}")
+            ser = serial.Serial(
+                SERIAL_PORT,
+                BAUD_RATE,
+                timeout=0.01,  # Reduced timeout for faster polling
+                write_timeout=0,
+                inter_byte_timeout=None
+            )
+            ser.reset_input_buffer()  # Clear any stale data
+            print(f"[INFO] Connected to {SERIAL_PORT} at {BAUD_RATE} baud")
             return ser
         except serial.SerialException as e:
             print(f"[ERROR] Failed to connect to {SERIAL_PORT}: {e}")
             attempt += 1
-            
+
             # Try USB reset after failed attempts
             if attempt % MAX_RECONNECT_ATTEMPTS == 0:
                 print(f"[INFO] {MAX_RECONNECT_ATTEMPTS} connection attempts failed, trying USB reset...")
                 reset_usb_device()
-                
+
             print(f"[INFO] Retrying in {RECONNECT_DELAY} seconds... (attempt {attempt})")
             time.sleep(RECONNECT_DELAY)
 
 # === Setup UDP ===
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1048576)  # 1MB send buffer
 print(f"[INFO] UDP target: {UDP_TARGET_IP}:{UDP_TARGET_PORT}")
 
-buffer = ""
+buffer = bytearray()  # Use bytearray for better performance
 ser = None
+packet_count = 0
+CSI_PREFIX = b"CSI:"
 
 try:
     ser = connect_serial()
-    
+
     while True:
         try:
-            if ser.in_waiting:
-                raw_bytes = ser.read(ser.in_waiting)
-                if raw_bytes:
-                    buffer += raw_bytes.decode('utf-8', errors='ignore')
-                    
-                    # Prevent buffer overflow
-                    if len(buffer) > MAX_BUFFER_SIZE:
-                        print("[WARN] Buffer overflow, clearing...")
-                        buffer = buffer[-MAX_BUFFER_SIZE//2:]
+            # Read all available data at once
+            bytes_available = ser.in_waiting
+            if bytes_available:
+                raw_bytes = ser.read(bytes_available)
+                buffer.extend(raw_bytes)
 
-                    # Process complete lines
-                    lines = buffer.split('\n')
-                    buffer = lines[-1]  # save last (possibly incomplete) part
-                    
-                    for line in lines[:-1]:
-                        line = line.strip()
-                        if line.startswith("CSI:"):
-                            try:
-                                # Extract CSI data after "CSI:" prefix
-                                csi_data = line[4:].strip()  # Remove "CSI:" prefix
-                                
-                                # main_gui.py expects format: "I1,Q1,I2,Q2,I3,Q3,..."
-                                # where each value is an integer (positive or negative)
-                                # Validate format before sending
-                                if csi_data and ',' in csi_data:
-                                    # Basic validation: check if it contains comma-separated data
-                                    values = csi_data.split(',')
-                                    if len(values) >= 2:  # At least one I/Q pair
-                                        payload = csi_data.encode('utf-8')
-                                        sock.sendto(payload, (UDP_TARGET_IP, UDP_TARGET_PORT))
-                                        print("[SENT]", csi_data[:50] + "..." if len(csi_data) > 50 else csi_data)
-                                    else:
-                                        print("[WARN] CSI data too short, skipping:", csi_data[:30])
-                                else:
-                                    print("[WARN] Invalid CSI format, skipping:", line[:30])
-                            except socket.error as e:
-                                print(f"[ERROR] UDP send failed: {e}")
+                # Prevent buffer overflow
+                if len(buffer) > MAX_BUFFER_SIZE:
+                    print(f"[WARN] Buffer overflow ({len(buffer)} bytes), clearing...")
+                    buffer = buffer[-MAX_BUFFER_SIZE//2:]
 
-            time.sleep(0.001)
-            
+                # Process complete lines
+                while b'\n' in buffer:
+                    line_end = buffer.index(b'\n')
+                    line = buffer[:line_end]
+                    buffer = buffer[line_end + 1:]
+
+                    if line.startswith(CSI_PREFIX):
+                        try:
+                            # Extract CSI data after "CSI:" prefix
+                            csi_data = line[4:].strip()
+
+                            # Quick validation: check for comma-separated data
+                            if b',' in csi_data and len(csi_data) > 10:
+                                sock.sendto(csi_data, (UDP_TARGET_IP, UDP_TARGET_PORT))
+                                packet_count += 1
+                                if packet_count % 100 == 0:
+                                    print(f"[SENT] {packet_count} packets")
+                        except socket.error as e:
+                            print(f"[ERROR] UDP send failed: {e}")
+
         except serial.SerialException as e:
             print(f"[ERROR] Serial connection lost: {e}")
             if ser:
                 ser.close()
             print("[INFO] Attempting to reconnect...")
             ser = connect_serial()
-            buffer = ""  # Clear buffer on reconnection
+            buffer.clear()  # Clear buffer on reconnection
 
 except KeyboardInterrupt:
-    print("\n[INFO] Stopped by user.")
+    print(f"\n[INFO] Stopped by user. Total packets sent: {packet_count}")
 finally:
     if ser and ser.is_open:
         ser.close()

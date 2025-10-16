@@ -237,20 +237,56 @@ class MainApp(tk.Tk):
             start_ts = time.time()
             self.progress.config(maximum=duration) # Set the progress bar's max value
 
-            
-            
+            # For real-time plotting
+            bfm_x_data = []
+            bfm_y_data = []
+            MAX_POINTS = 200
+            last_processed_files = set()
+
             while time.time() - start_ts < duration:
                 elapsed = time.time() - start_ts
                 self.progress['value'] = elapsed
                 self.timer_label.config(text=f"Time Remaining: {max(duration - int(elapsed), 0)}s")
-                time.sleep(0.1) 
-            
+
+                # Check for new collected files and extract BFM data for plotting
+                try:
+                    collected_files = self.bfm_collector.get_collected_files()
+                    new_files = collected_files - last_processed_files
+
+                    if new_files:
+                        for pcap_file in new_files:
+                            # Quick extraction of BFM data for real-time plotting
+                            bfm_data = self._extract_bfm_for_plot(pcap_file)
+                            if bfm_data:
+                                for _, value in bfm_data:
+                                    bfm_x_data.append(elapsed)
+                                    bfm_y_data.append(value)
+
+                                # Limit data points for performance
+                                if len(bfm_x_data) > MAX_POINTS:
+                                    bfm_x_data = bfm_x_data[-MAX_POINTS:]
+                                    bfm_y_data = bfm_y_data[-MAX_POINTS:]
+
+                                # Update the plot
+                                self.csi_line.set_xdata(bfm_x_data)
+                                self.csi_line.set_ydata(bfm_y_data)
+                                self.csi_ax.set_title("Real-time BFM Signal (phi11)")
+                                self.csi_ax.relim()
+                                self.csi_ax.autoscale_view()
+                                self.csi_canvas.draw()
+
+                        last_processed_files = collected_files.copy()
+                except Exception as plot_error:
+                    print(f"[BFM PLOT ERROR] {plot_error}")
+
+                time.sleep(0.1)
+
 
         except Exception as e:
             # It's good practice to catch errors from your modules
 
             if self.bfm_collector is None:
-                e = "Please click 'Setup BFM'"    
+                e = "Please click 'Setup BFM'"
 
             self.collect_msg.config(text=f"Error: {e}", foreground="red")
             print(f"[BFM ERROR] {e}")
@@ -266,7 +302,7 @@ class MainApp(tk.Tk):
 
                 to_be_processed = self.bfm_extractor.get_extracted_files() - self.bfm_extracted
                 self.bfm_preprocessor.process(to_be_processed)
-                
+
                 self.bfm_collected.update(self.bfm_collector.get_collected_files())
                 self.bfm_extracted.update(self.bfm_extractor.get_extracted_files())
 
@@ -487,6 +523,82 @@ class MainApp(tk.Tk):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
         return f"bfm_data_{label}_{timestamp}.pcap"
+
+    def _extract_bfm_for_plot(self, pcap_file):
+        """
+        Quickly extract BFM signal data from a pcap file for real-time plotting.
+        Uses tshark to extract phi11 values from BFM reports.
+        Returns a list of (timestamp, avg_phi11_value) tuples.
+        """
+        try:
+            import subprocess
+            import re
+
+            if not hasattr(self, 'bfm_extractor') or self.bfm_extractor is None:
+                return []
+
+            # Use tshark to extract BFM data quickly (limit to first 20 packets for speed)
+            display_filter = "wlan.fixed.category_code == 21"
+            command = [
+                self.bfm_extractor.tshark_path,
+                '-r', str(pcap_file),
+                '-Y', display_filter,
+                '-V',
+                '-c', '20'  # Only read first 20 packets
+            ]
+
+            bfm_values = []
+            phi_regex = re.compile(r"φ11:\s*(\d+)")
+            timestamp_regex = re.compile(r"Epoch (?:Arrival )?Time:\s*(\d+\.\d+)")
+
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8'
+            )
+
+            current_packet_text = ""
+            current_timestamp = None
+            current_phi_values = []
+
+            for line in process.stdout:
+                if line.startswith('Frame '):
+                    # Process previous packet
+                    if current_timestamp and current_phi_values:
+                        avg_phi = sum(current_phi_values) / len(current_phi_values)
+                        bfm_values.append((current_timestamp, avg_phi))
+
+                    # Reset for new packet
+                    current_timestamp = None
+                    current_phi_values = []
+                    current_packet_text = line
+                else:
+                    current_packet_text += line
+
+                    # Extract timestamp
+                    if not current_timestamp:
+                        ts_match = timestamp_regex.search(line)
+                        if ts_match:
+                            current_timestamp = float(ts_match.group(1))
+
+                    # Extract phi11 values
+                    phi_match = phi_regex.search(line)
+                    if phi_match:
+                        current_phi_values.append(int(phi_match.group(1)))
+
+            # Process last packet
+            if current_timestamp and current_phi_values:
+                avg_phi = sum(current_phi_values) / len(current_phi_values)
+                bfm_values.append((current_timestamp, avg_phi))
+
+            process.wait()
+            return bfm_values
+
+        except Exception as e:
+            print(f"[BFM EXTRACT ERROR] {e}")
+            return []
 
     def _build_training_ui(self, parent):
         self.train_btn = ttk.Button(parent, text="Start Training", command=self._on_train)
