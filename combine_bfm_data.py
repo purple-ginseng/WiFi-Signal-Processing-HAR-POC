@@ -7,23 +7,22 @@ def parse_args():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        '--directory', '-d',
-        type = str,
-        help = 'Path to directory containing bfm_data',
-        required = True
+        'directory',
+        metavar='INPUT_DIRECTORY_PATH',
+        type=str,
+        help='Path to directory containing bfm_data csv'
     )
 
     parser.add_argument(
-        '-o', '--output',
-        metavar='OUTPUT_PATH',  
+        'output',
+        metavar='OUTPUT_CSV_PATH',
         type=str,
-        required=True,        
         help='Path to save the filtered output CSV file.'
     )
 
     parser.add_argument(
         '--to-polar', '-p',
-        action='store_false',  
+        action='store_true',  
         help="Convert 'real' and 'imag' columns to 'magnitude' and 'phase'."
     )
 
@@ -41,5 +40,5 @@ if __name__ == '__main__':
 
     df = filter_by_mode(df, mode_cols=['transmitter_address', 'receiver_address'], group_by = ['session_id'])
     
-    df.to_csv(args.output)
+    df.to_csv(args.output, index = False)
     

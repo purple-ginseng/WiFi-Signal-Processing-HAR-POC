@@ -3,6 +3,9 @@ import re
 from pathlib import Path
 import pandas as pd
 import numpy as np
+from scipy.ndimage import median_filter
+import typing as tt
+from tqdm import tqdm
 
 def file_metadata(filepath):
     filepath = Path(filepath)
@@ -17,7 +20,7 @@ def file_metadata(filepath):
     activity = match.group(2)
     subject = match.group(3)
     collection_method = match.group(4)
-    foil_usage = match.group(5)
+    environment = match.group(5)
 
     date_str = match.group(6) 
     time_str = match.group(7) 
@@ -32,13 +35,30 @@ def file_metadata(filepath):
         activity = activity,
         subject = subject,
         collection_method = collection_method,
-        foil_usage = foil_usage,
+        environment = environment,
         time = time,
         session_id = datetime_str
     )
 
+ColumnInfo = tt.Dict[str, tt.Union[tt.List[str], tt.List[int]]]
 
-def get_bfm_columns(df): 
+def get_bfm_columns(df) -> ColumnInfo: 
+    """Extracts column names and subcarrier indices.
+
+    Args:
+        df: dataframe containing bfm data
+
+    Returns:
+        A dictionary containing the following keys:
+            'real_col' (List[str]): Column names for the real component.
+            'real_scidx' (List[int]): Subcarrier indices for the real component.
+            'imag_col' (List[str]): Column names for the imaginary component.
+            'imag_scidx' (List[int]): Subcarrier indices for the imaginary component.
+            'mag_col' (List[str]): Column names for the magnitude.
+            'mag_scidx' (List[int]): Subcarrier indices for the magnitude.
+            'phase_col' (List[str]): Column names for the phase.
+            'phase_scidx' (List[int]): Subcarrier indices for the phase.
+    """
     scidx_regex = r'SCIDX_(-?\d+)_'
     match_list = [re.search(scidx_regex, col) for col in df.columns]
     
@@ -77,7 +97,7 @@ def get_df_from_dir(data_dir):
     time_list = []
     data_dir = Path(data_dir)
 
-    for file in data_dir.rglob('bfm_data_*.csv'):
+    for file in tqdm(data_dir.rglob('bfm_data_*.csv')):
         file = Path(file)
         metadata = file_metadata(file)
 
@@ -87,6 +107,7 @@ def get_df_from_dir(data_dir):
         df = pd.read_csv(file)
         df.insert(0, 'activity', metadata['activity'])
         df.insert(0, 'subject', metadata['subject'])
+        df.insert(0, 'environment', metadata['environment'])
         df.insert(0, 'session_id', metadata['session_id'])
 
         df_list.append(df)
@@ -162,3 +183,27 @@ def filter_by_mode(df, mode_cols, group_by=None):
 
     # Merge to filter the original DataFrame
     return pd.merge(df, mode_identifier, on=grouping_cols)
+
+
+def median_filter_df(
+        df : pd.DataFrame, 
+        columns : tt.List[str], 
+        window_size : int, 
+        mode : str = 'nearest', 
+        group_by : tt.List[str] = None
+    ):
+    
+    if group_by is not None:
+        df_list = []
+        for idx, df_group in df.groupby(group_by):
+            filtered_data = median_filter(
+                df_group[columns],
+                size = (window_size, 1),
+                mode = 'nearest'
+            )
+            df_group[columns] = filtered_data
+            df_list.append(df_group)
+        
+        return pd.concat(df_list, axis = 0)
+    
+            
