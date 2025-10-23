@@ -11,9 +11,12 @@ import pandas as pd
 import streamlit as st
 from matplotlib.colors import Normalize
 from matplotlib.ticker import MaxNLocator
+from scipy.signal import spectrogram, detrend
+from scipy.ndimage import gaussian_filter, uniform_filter1d
 
 DATA_DIR = "./bfm_processed_csv"
 SUBCARRIER_PATTERN = re.compile(r"SCIDX_(-?\d+)_Ratio_(Real|Imag)", re.IGNORECASE)
+CMAPS = ["turbo", "viridis", "jet", "plasma", "inferno", "magma", "cividis", "RdYlBu_r", "twilight", "hsv"]
 
 
 def request_rerun() -> None:
@@ -157,8 +160,20 @@ def plot_heatmap(
     magnitude_window: np.ndarray,
     cmap: str = "turbo",
     highlight_time: Optional[float] = None,
+    interpolation: str = "bilinear",
+    smoothing: float = 0.5,
+    vmin: Optional[float] = None,
+    vmax: Optional[float] = None,
 ) -> plt.Figure:
+    """Enhanced heatmap with smoothing and fixed color scaling"""
     fig, ax = plt.subplots(figsize=(10, 4))
+
+    # Apply smoothing to reduce noise
+    if smoothing > 0:
+        magnitude_smooth = gaussian_filter(magnitude_window, sigma=smoothing)
+    else:
+        magnitude_smooth = magnitude_window
+
     if len(time_axis) == 1:
         span = 1.0
         extent = [
@@ -169,22 +184,27 @@ def plot_heatmap(
         ]
     else:
         extent = [time_axis[0], time_axis[-1], subcarrier_values[0], subcarrier_values[-1]]
+
+    # Use explicit vmin/vmax for consistent color scaling
     mesh = ax.imshow(
-        magnitude_window.T,
+        magnitude_smooth.T,
         aspect="auto",
         origin="lower",
         extent=extent,
         cmap=cmap,
-        interpolation="nearest"
+        interpolation=interpolation,
+        vmin=vmin,
+        vmax=vmax,
     )
-    ax.set_title("Magnitude Heatmap (Time × Subcarrier)")
+    ax.set_title("Magnitude Heatmap (Time × Subcarrier)", fontsize=12, fontweight='bold')
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Subcarrier Index")
     ax.xaxis.set_major_locator(MaxNLocator(6))
     if highlight_time is not None:
-        ax.axvline(highlight_time, color="#ff4d4f", linestyle="--", linewidth=1.2, alpha=0.8)
+        ax.axvline(highlight_time, color="#ff4d4f", linestyle="--", linewidth=1.5, alpha=0.9)
     cbar = fig.colorbar(mesh, ax=ax)
-    cbar.set_label("|H|")
+    cbar.set_label("|H|", fontsize=10)
+    ax.grid(True, alpha=0.2, color='white', linewidth=0.5)
     return fig
 
 
@@ -274,10 +294,239 @@ def plot_average_beam_pattern(complex_matrix: np.ndarray, subcarrier_values: lis
     return fig
 
 
+def plot_spectrogram_analysis(
+    time_axis: np.ndarray,
+    complex_matrix: np.ndarray,
+    fs: float = 100.0,
+    cmap: str = "viridis",
+) -> plt.Figure:
+    """Time-frequency spectrogram of beamforming magnitude"""
+    # Compute mean magnitude across subcarriers
+    mean_mag = np.nanmean(np.abs(complex_matrix), axis=1)
+
+    if len(mean_mag) < 16:
+        # Not enough samples for meaningful spectrogram
+        fig, ax = plt.subplots(figsize=(10, 3))
+        ax.text(0.5, 0.5, "Insufficient samples for spectrogram",
+                ha='center', va='center', transform=ax.transAxes)
+        ax.set_title("Spectrogram (Need more samples)")
+        return fig
+
+    # Detrend and compute spectrogram
+    signal_detrended = detrend(mean_mag)
+    nperseg = min(64, max(16, len(signal_detrended) // 4))
+    f, t, Sxx = spectrogram(signal_detrended, fs=fs, nperseg=nperseg,
+                            noverlap=nperseg // 2)
+
+    # Convert to dB scale
+    Sxx_db = 10 * np.log10(Sxx + 1e-10)
+
+    fig, ax = plt.subplots(figsize=(10, 3))
+    pcm = ax.pcolormesh(t, f, Sxx_db, shading="gouraud", cmap=cmap)
+    ax.set_title("Time-Frequency Spectrogram (Mean Magnitude)", fontsize=12, fontweight='bold')
+    ax.set_ylabel("Frequency (Hz)")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylim(0, fs / 2)
+    cbar = fig.colorbar(pcm, ax=ax, label="Power (dB)")
+    cbar.ax.tick_params(labelsize=9)
+    plt.tight_layout()
+    return fig
+
+
+def plot_doppler_shift_analysis(
+    complex_matrix: np.ndarray,
+    fs: float = 100.0,
+    cmap: str = "plasma",
+) -> plt.Figure:
+    """Doppler shift analysis across subcarriers"""
+    magnitudes = np.abs(complex_matrix)
+    phases = np.unwrap(np.angle(complex_matrix), axis=0)
+
+    # Weighted coherent signal
+    weights = magnitudes / (np.sum(magnitudes, axis=1, keepdims=True) + 1e-10)
+    coherent_signal = np.sum(complex_matrix * weights, axis=1)
+    coherent_phase = np.unwrap(np.angle(coherent_signal))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+
+    # 1. Doppler spectrum
+    if len(coherent_phase) >= 8:
+        coherent_detrended = detrend(coherent_phase)
+        window = np.hanning(len(coherent_detrended))
+        windowed = coherent_detrended * window
+        fft_coherent = np.fft.fftshift(np.fft.fft(windowed))
+        power_coherent = np.abs(fft_coherent) ** 2
+        freqs = np.fft.fftshift(np.fft.fftfreq(len(coherent_phase), 1 / fs))
+
+        ax1.plot(freqs, 10 * np.log10(power_coherent + 1e-10), 'b-', linewidth=2)
+        ax1.set_title("Doppler Spectrum", fontsize=11, fontweight='bold')
+        ax1.set_xlabel("Doppler Frequency (Hz)")
+        ax1.set_ylabel("Power (dB)")
+        ax1.grid(True, alpha=0.3)
+        ax1.axvline(x=0, color='red', linestyle='--', alpha=0.7)
+    else:
+        ax1.text(0.5, 0.5, "Need more samples", ha='center', va='center', transform=ax1.transAxes)
+        ax1.set_title("Doppler Spectrum")
+
+    # 2. Phase velocity (derivative)
+    phase_velocity = np.diff(phases, axis=0)
+    mean_phase_vel = np.mean(phase_velocity, axis=1)
+    time_axis = np.arange(len(mean_phase_vel)) / fs
+
+    ax2.plot(time_axis, mean_phase_vel, 'orange', linewidth=2)
+    ax2.fill_between(time_axis, mean_phase_vel, alpha=0.3, color='orange')
+    ax2.set_title("Phase Velocity (Doppler)", fontsize=11, fontweight='bold')
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Phase Change (rad/frame)")
+    ax2.grid(True, alpha=0.3)
+    ax2.axhline(y=0, color='red', linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_timeline_overview(
+    time_axis: np.ndarray,
+    profiles: dict[str, np.ndarray],
+    current_idx: int,
+    window_start: int,
+    window_end: int,
+) -> plt.Figure:
+    """Mini overview showing full timeline with current position"""
+    fig, ax = plt.subplots(figsize=(10, 1.5))
+
+    # Plot mean magnitude as overview
+    ax.plot(time_axis, profiles["mean"], 'b-', linewidth=1, alpha=0.7)
+    ax.fill_between(time_axis, profiles["mean"], alpha=0.2)
+
+    # Highlight current window
+    ax.axvspan(time_axis[window_start], time_axis[window_end - 1],
+               alpha=0.3, color='yellow', label='Current window')
+
+    # Mark current position
+    ax.axvline(time_axis[current_idx], color='red', linestyle='--',
+               linewidth=2, alpha=0.9, label='Current frame')
+
+    ax.set_xlabel("Time (s)", fontsize=9)
+    ax.set_ylabel("Mean |H|", fontsize=9)
+    ax.set_title("Timeline Overview", fontsize=10, fontweight='bold')
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(labelsize=8)
+
+    plt.tight_layout()
+    return fig
+
+
+def compute_motion_metrics(complex_matrix: np.ndarray) -> dict[str, np.ndarray]:
+    """Compute motion-related metrics from beamforming data"""
+    magnitudes = np.abs(complex_matrix)
+    phases = np.unwrap(np.angle(complex_matrix), axis=0)
+
+    # 1. Temporal variance (motion indicator)
+    temporal_variance = np.var(magnitudes, axis=0)
+    avg_temporal_variance = np.mean(temporal_variance)
+
+    # 2. Phase velocity variance (Doppler spread)
+    if len(phases) > 1:
+        phase_velocity = np.diff(phases, axis=0)
+        doppler_variance = np.var(phase_velocity, axis=1)
+        avg_doppler_variance = np.mean(doppler_variance)
+    else:
+        doppler_variance = np.array([0.0])
+        avg_doppler_variance = 0.0
+
+    # 3. Magnitude change rate
+    if len(magnitudes) > 1:
+        mag_diff = np.diff(magnitudes, axis=0)
+        change_rate = np.mean(np.abs(mag_diff), axis=1)
+        avg_change_rate = np.mean(change_rate)
+    else:
+        change_rate = np.array([0.0])
+        avg_change_rate = 0.0
+
+    return {
+        "temporal_variance": temporal_variance,
+        "avg_temporal_variance": avg_temporal_variance,
+        "doppler_variance": doppler_variance,
+        "avg_doppler_variance": avg_doppler_variance,
+        "change_rate": change_rate,
+        "avg_change_rate": avg_change_rate,
+    }
+
+
+def plot_motion_analysis(
+    time_axis: np.ndarray,
+    motion_metrics: dict[str, np.ndarray],
+) -> plt.Figure:
+    """Visualize motion detection metrics"""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
+
+    # Adjust time axis for diff-based metrics
+    time_diff = time_axis[1:] if len(time_axis) > 1 else time_axis
+
+    # 1. Change rate (motion activity)
+    change_rate = motion_metrics["change_rate"]
+    if len(change_rate) > 0:
+        ax1.plot(time_diff[:len(change_rate)], change_rate, 'g-', linewidth=2)
+        ax1.fill_between(time_diff[:len(change_rate)], change_rate, alpha=0.3, color='green')
+        ax1.set_ylabel("Magnitude Change Rate", fontsize=10)
+        ax1.set_title("Motion Activity Indicators", fontsize=11, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+
+        # Add threshold line
+        threshold = np.percentile(change_rate, 75)
+        ax1.axhline(y=threshold, color='red', linestyle='--', alpha=0.5,
+                   label=f'75th percentile: {threshold:.3f}')
+        ax1.legend(fontsize=8)
+
+    # 2. Doppler variance (motion complexity)
+    doppler_var = motion_metrics["doppler_variance"]
+    if len(doppler_var) > 0:
+        ax2.plot(time_diff[:len(doppler_var)], doppler_var, 'purple', linewidth=2)
+        ax2.fill_between(time_diff[:len(doppler_var)], doppler_var, alpha=0.3, color='purple')
+        ax2.set_ylabel("Doppler Variance", fontsize=10)
+        ax2.set_xlabel("Time (s)", fontsize=10)
+        ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    return fig
+
+
 def main() -> None:
     st.set_page_config("📡 Beamforming Explorer", layout="wide")
-    st.title("📡 Beamforming (BFM) Explorer")
-    st.caption("Inspect temporal and spatial beamforming characteristics from processed CSV logs.")
+    st.title("📡 Enhanced Beamforming (BFM) Explorer")
+    st.caption("Advanced visualization suite for temporal and spatial beamforming characteristics")
+
+    # Feature highlights
+    with st.expander("ℹ️ What's New - Enhanced Features", expanded=False):
+        st.markdown("""
+        ### 🎬 Smooth Playback Controls
+        - **Presets**: Choose from Smooth (1 step), Normal (10 steps), or Fast (25 steps) playback modes
+        - **Custom FPS**: Adjust playback speed from 5-60 FPS for ultra-smooth transitions
+        - **Variable step size**: Fine-tune how many samples to skip per frame
+
+        ### 🎨 Advanced Visualization
+        - **Fixed color scaling**: Prevents flickering/blinking in heatmaps during playback
+        - **Gaussian smoothing**: Adjustable sigma (0-2.0) to reduce noise in heatmaps
+        - **Multiple colormaps**: 10 different color schemes including turbo, viridis, jet, plasma, and more
+        - **Interpolation options**: Bilinear, nearest, bicubic, or gaussian interpolation
+
+        ### 🌊 Frequency Domain Analysis
+        - **Spectrogram**: Time-frequency analysis showing Doppler shifts over time
+        - **Doppler spectrum**: FFT-based frequency analysis of phase changes
+        - **Phase velocity**: Real-time Doppler shift visualization
+
+        ### 🎯 Motion Detection
+        - **Change rate tracking**: Magnitude variation indicating motion activity
+        - **Doppler variance**: Phase velocity spread showing motion complexity
+        - **Activity metrics**: Global statistics for motion characterization
+
+        ### 🗺️ Navigation Enhancements
+        - **Timeline overview**: Mini-map showing current position and window in full dataset
+        - **Window highlighting**: Visual indication of current analysis window
+        - **Frame position indicator**: Real-time position tracking with red marker
+        """)
 
     files = get_available_files(DATA_DIR)
     if not files:
@@ -314,12 +563,21 @@ def main() -> None:
         st.stop()
 
     summary = compute_summary_stats(complex_matrix)
-    info_cols = st.columns(3)
+    motion_metrics = compute_motion_metrics(complex_matrix)
+
+    info_cols = st.columns(4)
     info_cols[0].metric("Samples", f"{num_samples:,}")
     info_cols[1].metric("Subcarriers", f"{num_subcarriers}")
     info_cols[2].metric("Mean |H|", f"{summary['mean_magnitude']:.3f}")
-    st.sidebar.metric("Max |H|", f"{summary['max_magnitude']:.3f}")
+    info_cols[3].metric("Max |H|", f"{summary['max_magnitude']:.3f}")
+
+    # Sidebar stats
+    st.sidebar.markdown("### 📊 Global Statistics")
     st.sidebar.metric("Circular variance", f"{summary['circular_variance']:.3f}")
+    st.sidebar.metric("Motion activity", f"{motion_metrics['avg_change_rate']:.4f}",
+                     help="Average magnitude change rate")
+    st.sidebar.metric("Doppler spread", f"{motion_metrics['avg_doppler_variance']:.4f}",
+                     help="Average phase velocity variance")
 
     state = st.session_state
     if "bfm_playback_idx" not in state:
@@ -333,6 +591,44 @@ def main() -> None:
     max_step = max(1, min(200, max(1, num_samples - 1)))
     state.bfm_step = int(np.clip(state.bfm_step, 1, max_step))
 
+    st.sidebar.markdown("### 🎬 Playback Presets")
+    preset = st.sidebar.radio(
+        "Speed preset",
+        ["Custom", "🐌 Smooth (1 step)", "⚡ Normal (10 steps)", "🚀 Fast (25 steps)"],
+        horizontal=False,
+        label_visibility="collapsed"
+    )
+
+    # Apply preset values
+    if preset == "🐌 Smooth (1 step)":
+        state.bfm_step = 1
+        playback_fps = 20
+        st.sidebar.info("Smooth: 1 step, 20 FPS")
+    elif preset == "⚡ Normal (10 steps)":
+        state.bfm_step = 10
+        playback_fps = 30
+        st.sidebar.info("Normal: 10 steps, 30 FPS")
+    elif preset == "🚀 Fast (25 steps)":
+        state.bfm_step = 25
+        playback_fps = 40
+        st.sidebar.info("Fast: 25 steps, 40 FPS")
+    else:  # Custom
+        playback_fps = st.sidebar.slider("FPS (frames/sec)", 5, 60, 30, 5,
+                                         help="Playback speed in frames per second")
+        step_slider_val = st.sidebar.slider(
+            "Playback step (samples)",
+            min_value=1,
+            max_value=max_step,
+            value=state.bfm_step,
+            key="bfm_step_slider",
+        )
+        state.bfm_step = int(step_slider_val)
+
+    # Store FPS in state
+    if "bfm_fps" not in state:
+        state.bfm_fps = 30
+    state.bfm_fps = playback_fps
+
     st.sidebar.markdown("### Timeline playback")
     ctrl_cols = st.sidebar.columns(3)
     if ctrl_cols[0].button("⏮️", use_container_width=True):
@@ -343,14 +639,6 @@ def main() -> None:
     if ctrl_cols[2].button("⏭️ End", use_container_width=True):
         state.bfm_playback_idx = num_samples - 1
         state.bfm_playing = False
-    step_slider_val = st.sidebar.slider(
-        "Playback step (samples)",
-        min_value=1,
-        max_value=max_step,
-        value=state.bfm_step,
-        key="bfm_step_slider",
-    )
-    state.bfm_step = int(step_slider_val)
 
     slider_val = st.sidebar.slider(
         "Timeline index",
@@ -392,9 +680,14 @@ def main() -> None:
     magnitudes = np.abs(complex_matrix)
     phases = np.angle(complex_matrix)
 
+    # Progress bar
+    progress_pct = (highlight_idx / max(1, num_samples - 1)) * 100
+    st.progress(highlight_idx / max(1, num_samples - 1))
+
     st.caption(
-        f"Timeline position: sample {highlight_idx + 1}/{num_samples} • t = {highlight_time:.3f} s "
-        f"(window {window_start + 1} – {highlight_idx + 1})"
+        f"📍 **Timeline position:** sample {highlight_idx + 1}/{num_samples} ({progress_pct:.1f}%) • "
+        f"⏱️ t = {highlight_time:.3f} s • "
+        f"🪟 window [{window_start + 1} – {highlight_idx + 1}]"
     )
 
     frame_cols = st.columns(3)
@@ -402,7 +695,35 @@ def main() -> None:
     frame_cols[1].metric("Frame peak |H|", f"{temporal_profiles['peak'][highlight_idx]:.3f}")
     frame_cols[2].metric("Phase coherence", f"{temporal_profiles['alignment'][highlight_idx]:.3f}")
 
-    st.sidebar.markdown("### Visualization controls")
+    st.sidebar.markdown("### 🎨 Visualization controls")
+
+    # Colormap selection
+    cmap_choice = st.sidebar.selectbox("Color Map", CMAPS, index=0,
+                                       help="Color scheme for heatmaps and spectrograms")
+
+    # Heatmap smoothing and interpolation
+    with st.sidebar.expander("🔧 Heatmap Settings", expanded=False):
+        heatmap_smoothing = st.slider("Smoothing (sigma)", 0.0, 2.0, 0.5, 0.1,
+                                       help="Gaussian smoothing for heatmap (0=none)")
+        heatmap_interpolation = st.selectbox("Interpolation",
+                                              ["bilinear", "nearest", "bicubic", "gaussian"],
+                                              index=0)
+        use_fixed_colorscale = st.checkbox("Fixed color scale", value=True,
+                                            help="Use global min/max to prevent color flickering")
+
+    # Calculate global color scale if enabled
+    if use_fixed_colorscale:
+        if "bfm_global_vmin" not in state or state.bfm_last_file != selected_file:
+            magnitudes_full = np.abs(complex_matrix)
+            state.bfm_global_vmin = float(np.percentile(magnitudes_full, 2))
+            state.bfm_global_vmax = float(np.percentile(magnitudes_full, 98))
+        global_vmin = state.bfm_global_vmin
+        global_vmax = state.bfm_global_vmax
+    else:
+        global_vmin = None
+        global_vmax = None
+
+    # Subcarrier selection
     default_idx = np.linspace(0, len(subcarrier_values) - 1, num=4, dtype=int)
     default_selection = [subcarrier_values[i] for i in default_idx]
     subcarrier_choice = st.sidebar.multiselect(
@@ -425,6 +746,14 @@ def main() -> None:
     subcarrier_lookup = {value: pos for pos, value in enumerate(subcarrier_values)}
     highlight_indices = [subcarrier_lookup[val] for val in subcarrier_choice]
 
+    # Timeline overview minimap
+    st.markdown("---")
+    st.markdown("## 🗺️ Timeline Overview")
+    st.pyplot(plot_timeline_overview(time_axis, temporal_profiles, highlight_idx, window_start, window_end))
+
+    # Main visualizations
+    st.markdown("---")
+    st.markdown("## 📊 Temporal Analysis")
     col_time, col_constellation = st.columns((2, 1))
     with col_time:
         st.pyplot(
@@ -446,25 +775,74 @@ def main() -> None:
             )
         )
 
-    st.pyplot(plot_heatmap(window_time, subcarrier_values, magnitude_window, highlight_time=highlight_window_time))
+    st.markdown("---")
+    st.markdown("## 🔥 Magnitude Heatmap")
+    st.pyplot(plot_heatmap(
+        window_time,
+        subcarrier_values,
+        magnitude_window,
+        cmap=cmap_choice,
+        highlight_time=highlight_window_time,
+        interpolation=heatmap_interpolation,
+        smoothing=heatmap_smoothing,
+        vmin=global_vmin,
+        vmax=global_vmax,
+    ))
+
+    st.markdown("---")
+    st.markdown("## 📈 Temporal Insights")
     st.pyplot(plot_temporal_insights(window_time, window_profiles, highlight_time=highlight_window_time))
 
-    with st.expander("Polar snapshot", expanded=False):
-        st.pyplot(plot_polar_snapshot(phases, magnitudes, subcarrier_values, highlight_idx))
+    # Advanced frequency analysis
+    st.markdown("---")
+    st.markdown("## 🌊 Frequency Domain Analysis")
 
-    with st.expander("Average beamforming envelope", expanded=False):
-        st.pyplot(plot_average_beam_pattern(complex_matrix, subcarrier_values))
+    # Calculate effective sampling rate
+    if len(time_axis) > 1:
+        effective_fs = 1.0 / np.mean(np.diff(time_axis)) if np.mean(np.diff(time_axis)) > 0 else 100.0
+    else:
+        effective_fs = 100.0
 
-    with st.expander("Raw metadata", expanded=False):
+    col_spec, col_doppler = st.columns(2)
+    with col_spec:
+        st.pyplot(plot_spectrogram_analysis(window_time, complex_window, fs=effective_fs, cmap=cmap_choice))
+    with col_doppler:
+        st.pyplot(plot_doppler_shift_analysis(complex_window, fs=effective_fs, cmap=cmap_choice))
+
+    # Motion analysis
+    st.markdown("---")
+    st.markdown("## 🎯 Motion Detection Analysis")
+    st.pyplot(plot_motion_analysis(time_axis, motion_metrics))
+
+    # Expandable advanced views
+    st.markdown("---")
+    st.markdown("## 🔬 Advanced Analysis (Click to Expand)")
+
+    col_exp1, col_exp2 = st.columns(2)
+
+    with col_exp1:
+        with st.expander("🔵 Polar Snapshot (Current Frame)", expanded=False):
+            st.pyplot(plot_polar_snapshot(phases, magnitudes, subcarrier_values, highlight_idx))
+
+    with col_exp2:
+        with st.expander("📡 Average Beamforming Envelope", expanded=False):
+            st.pyplot(plot_average_beam_pattern(complex_matrix, subcarrier_values))
+
+    with st.expander("📋 Raw Metadata Preview", expanded=False):
         meta_cols = [c for c in df.columns if not c.startswith("SCIDX_")]
-        st.dataframe(df[meta_cols].head(20))
+        if meta_cols:
+            st.dataframe(df[meta_cols].head(20))
+        else:
+            st.info("No metadata columns found (only SCIDX_* data available)")
 
     if state.bfm_playing:
         if highlight_idx >= num_samples - 1:
             state.bfm_playing = False
         else:
             next_idx = min(highlight_idx + state.bfm_step, num_samples - 1)
-            time.sleep(0.15)
+            # Use FPS to determine sleep time
+            sleep_time = 1.0 / state.bfm_fps
+            time.sleep(sleep_time)
             state.bfm_playback_idx = next_idx
             request_rerun()
 
