@@ -5,6 +5,10 @@ import time
 from functools import lru_cache
 from typing import Optional
 
+# Configure matplotlib BEFORE importing pyplot for thread safety
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for thread safety
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -13,6 +17,10 @@ from matplotlib.colors import Normalize
 from matplotlib.ticker import MaxNLocator
 from scipy.signal import spectrogram, detrend
 from scipy.ndimage import gaussian_filter, uniform_filter1d
+
+# Disable matplotlib warnings
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
 
 DATA_DIR = "./bfm_processed_csv"
 SUBCARRIER_PATTERN = re.compile(r"SCIDX_(-?\d+)_Ratio_(Real|Imag)", re.IGNORECASE)
@@ -71,6 +79,10 @@ def build_complex_matrix(cache_key: tuple[str, int]) -> tuple[np.ndarray, np.nda
     df_real = df[real_cols].apply(pd.to_numeric, errors="coerce")
     df_imag = df[imag_cols].apply(pd.to_numeric, errors="coerce")
 
+    # Fill NaN values with 0 to prevent downstream issues
+    df_real = df_real.fillna(0.0)
+    df_imag = df_imag.fillna(0.0)
+
     if downsample > 1:
         df_real = df_real.iloc[::downsample].reset_index(drop=True)
         df_imag = df_imag.iloc[::downsample].reset_index(drop=True)
@@ -81,6 +93,9 @@ def build_complex_matrix(cache_key: tuple[str, int]) -> tuple[np.ndarray, np.nda
         timestamps = df["timestamp"] if "timestamp" in df.columns else None
 
     complex_matrix = df_real.to_numpy(dtype=np.float32) + 1j * df_imag.to_numpy(dtype=np.float32)
+
+    # Final check: replace any inf values that might have been introduced
+    complex_matrix[~np.isfinite(complex_matrix)] = 0
 
     if timestamps is not None:
         timestamps = timestamps.to_numpy(dtype=np.float64)
@@ -164,15 +179,22 @@ def plot_heatmap(
     smoothing: float = 0.5,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
+    mask_zeros: bool = False,
 ) -> plt.Figure:
     """Enhanced heatmap with smoothing and fixed color scaling"""
     fig, ax = plt.subplots(figsize=(10, 4))
 
+    # Optionally mask near-zero values
+    if mask_zeros:
+        magnitude_display = np.where(magnitude_window < 0.1, np.nan, magnitude_window)
+    else:
+        magnitude_display = magnitude_window
+
     # Apply smoothing to reduce noise
     if smoothing > 0:
-        magnitude_smooth = gaussian_filter(magnitude_window, sigma=smoothing)
+        magnitude_smooth = gaussian_filter(magnitude_display, sigma=smoothing)
     else:
-        magnitude_smooth = magnitude_window
+        magnitude_smooth = magnitude_display
 
     if len(time_axis) == 1:
         span = 1.0
@@ -185,6 +207,13 @@ def plot_heatmap(
     else:
         extent = [time_axis[0], time_axis[-1], subcarrier_values[0], subcarrier_values[-1]]
 
+    # Calculate actual range in this window for info
+    valid_data = magnitude_window[np.isfinite(magnitude_window) & (magnitude_window > 0)]
+    if len(valid_data) > 0:
+        actual_min, actual_max = valid_data.min(), valid_data.max()
+    else:
+        actual_min, actual_max = 0, 0
+
     # Use explicit vmin/vmax for consistent color scaling
     mesh = ax.imshow(
         magnitude_smooth.T,
@@ -196,7 +225,10 @@ def plot_heatmap(
         vmin=vmin,
         vmax=vmax,
     )
-    ax.set_title("Magnitude Heatmap (Time × Subcarrier)", fontsize=12, fontweight='bold')
+
+    # Add window stats to title
+    title = f"Magnitude Heatmap (Time × Subcarrier)\nWindow range: [{actual_min:.2f}, {actual_max:.2f}]"
+    ax.set_title(title, fontsize=11, fontweight='bold')
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Subcarrier Index")
     ax.xaxis.set_major_locator(MaxNLocator(6))
@@ -340,37 +372,60 @@ def plot_doppler_shift_analysis(
 ) -> plt.Figure:
     """Doppler shift analysis across subcarriers"""
     magnitudes = np.abs(complex_matrix)
-    phases = np.unwrap(np.angle(complex_matrix), axis=0)
+
+    # Clean up complex_matrix: replace any NaN or inf values
+    complex_matrix_clean = np.copy(complex_matrix)
+    complex_matrix_clean[~np.isfinite(complex_matrix_clean)] = 0
+
+    phases = np.unwrap(np.angle(complex_matrix_clean), axis=0)
+
+    # Remove any NaN or inf that might have been introduced by unwrap
+    phases = np.nan_to_num(phases, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Weighted coherent signal
     weights = magnitudes / (np.sum(magnitudes, axis=1, keepdims=True) + 1e-10)
-    coherent_signal = np.sum(complex_matrix * weights, axis=1)
+    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
+
+    coherent_signal = np.sum(complex_matrix_clean * weights, axis=1)
     coherent_phase = np.unwrap(np.angle(coherent_signal))
+
+    # Clean coherent_phase
+    coherent_phase = np.nan_to_num(coherent_phase, nan=0.0, posinf=0.0, neginf=0.0)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
 
     # 1. Doppler spectrum
-    if len(coherent_phase) >= 8:
-        coherent_detrended = detrend(coherent_phase)
-        window = np.hanning(len(coherent_detrended))
-        windowed = coherent_detrended * window
-        fft_coherent = np.fft.fftshift(np.fft.fft(windowed))
-        power_coherent = np.abs(fft_coherent) ** 2
-        freqs = np.fft.fftshift(np.fft.fftfreq(len(coherent_phase), 1 / fs))
+    if len(coherent_phase) >= 8 and np.any(coherent_phase != 0):
+        try:
+            coherent_detrended = detrend(coherent_phase)
+            coherent_detrended = np.nan_to_num(coherent_detrended, nan=0.0, posinf=0.0, neginf=0.0)
 
-        ax1.plot(freqs, 10 * np.log10(power_coherent + 1e-10), 'b-', linewidth=2)
-        ax1.set_title("Doppler Spectrum", fontsize=11, fontweight='bold')
-        ax1.set_xlabel("Doppler Frequency (Hz)")
-        ax1.set_ylabel("Power (dB)")
-        ax1.grid(True, alpha=0.3)
-        ax1.axvline(x=0, color='red', linestyle='--', alpha=0.7)
+            window = np.hanning(len(coherent_detrended))
+            windowed = coherent_detrended * window
+            fft_coherent = np.fft.fftshift(np.fft.fft(windowed))
+            power_coherent = np.abs(fft_coherent) ** 2
+            freqs = np.fft.fftshift(np.fft.fftfreq(len(coherent_phase), 1 / fs))
+
+            ax1.plot(freqs, 10 * np.log10(power_coherent + 1e-10), 'b-', linewidth=2)
+            ax1.set_title("Doppler Spectrum", fontsize=11, fontweight='bold')
+            ax1.set_xlabel("Doppler Frequency (Hz)")
+            ax1.set_ylabel("Power (dB)")
+            ax1.grid(True, alpha=0.3)
+            ax1.axvline(x=0, color='red', linestyle='--', alpha=0.7)
+        except Exception as e:
+            ax1.text(0.5, 0.5, f"Error: {str(e)[:30]}", ha='center', va='center', transform=ax1.transAxes)
+            ax1.set_title("Doppler Spectrum (Error)")
     else:
-        ax1.text(0.5, 0.5, "Need more samples", ha='center', va='center', transform=ax1.transAxes)
+        ax1.text(0.5, 0.5, "Need more samples or invalid data", ha='center', va='center', transform=ax1.transAxes)
         ax1.set_title("Doppler Spectrum")
 
     # 2. Phase velocity (derivative)
     phase_velocity = np.diff(phases, axis=0)
-    mean_phase_vel = np.mean(phase_velocity, axis=1)
+    phase_velocity = np.nan_to_num(phase_velocity, nan=0.0, posinf=0.0, neginf=0.0)
+
+    mean_phase_vel = np.nanmean(phase_velocity, axis=1)
+    mean_phase_vel = np.nan_to_num(mean_phase_vel, nan=0.0, posinf=0.0, neginf=0.0)
+
     time_axis = np.arange(len(mean_phase_vel)) / fs
 
     ax2.plot(time_axis, mean_phase_vel, 'orange', linewidth=2)
@@ -420,18 +475,28 @@ def plot_timeline_overview(
 
 def compute_motion_metrics(complex_matrix: np.ndarray) -> dict[str, np.ndarray]:
     """Compute motion-related metrics from beamforming data"""
-    magnitudes = np.abs(complex_matrix)
-    phases = np.unwrap(np.angle(complex_matrix), axis=0)
+    # Clean complex matrix
+    complex_matrix_clean = np.copy(complex_matrix)
+    complex_matrix_clean[~np.isfinite(complex_matrix_clean)] = 0
+
+    magnitudes = np.abs(complex_matrix_clean)
+    phases = np.unwrap(np.angle(complex_matrix_clean), axis=0)
+
+    # Clean phases
+    phases = np.nan_to_num(phases, nan=0.0, posinf=0.0, neginf=0.0)
 
     # 1. Temporal variance (motion indicator)
     temporal_variance = np.var(magnitudes, axis=0)
-    avg_temporal_variance = np.mean(temporal_variance)
+    temporal_variance = np.nan_to_num(temporal_variance, nan=0.0, posinf=0.0, neginf=0.0)
+    avg_temporal_variance = float(np.nanmean(temporal_variance))
 
     # 2. Phase velocity variance (Doppler spread)
     if len(phases) > 1:
         phase_velocity = np.diff(phases, axis=0)
+        phase_velocity = np.nan_to_num(phase_velocity, nan=0.0, posinf=0.0, neginf=0.0)
         doppler_variance = np.var(phase_velocity, axis=1)
-        avg_doppler_variance = np.mean(doppler_variance)
+        doppler_variance = np.nan_to_num(doppler_variance, nan=0.0, posinf=0.0, neginf=0.0)
+        avg_doppler_variance = float(np.nanmean(doppler_variance))
     else:
         doppler_variance = np.array([0.0])
         avg_doppler_variance = 0.0
@@ -439,8 +504,10 @@ def compute_motion_metrics(complex_matrix: np.ndarray) -> dict[str, np.ndarray]:
     # 3. Magnitude change rate
     if len(magnitudes) > 1:
         mag_diff = np.diff(magnitudes, axis=0)
-        change_rate = np.mean(np.abs(mag_diff), axis=1)
-        avg_change_rate = np.mean(change_rate)
+        mag_diff = np.nan_to_num(mag_diff, nan=0.0, posinf=0.0, neginf=0.0)
+        change_rate = np.nanmean(np.abs(mag_diff), axis=1)
+        change_rate = np.nan_to_num(change_rate, nan=0.0, posinf=0.0, neginf=0.0)
+        avg_change_rate = float(np.nanmean(change_rate))
     else:
         change_rate = np.array([0.0])
         avg_change_rate = 0.0
@@ -533,7 +600,15 @@ def main() -> None:
         st.error(f"No CSV files found under `{DATA_DIR}`.")
         st.stop()
 
-    selected_file = st.sidebar.selectbox("Select Beamforming Capture", files)
+    # Set default file for realtime activity testing
+    default_file = "bfm_data_pg_standing_home_20251027_211523.csv"
+    default_index = 0
+    for i, f in enumerate(files):
+        if default_file in f:
+            default_index = i
+            break
+
+    selected_file = st.sidebar.selectbox("Select Beamforming Capture", files, index=default_index)
 
     state = st.session_state
     if "bfm_last_file" not in state:
@@ -711,17 +786,32 @@ def main() -> None:
         use_fixed_colorscale = st.checkbox("Fixed color scale", value=True,
                                             help="Use global min/max to prevent color flickering")
 
+        # Option to mask very low values
+        mask_zeros = st.checkbox("Mask near-zero values", value=False,
+                                 help="Set values below 0.1 to NaN (white) for clearer visualization")
+
     # Calculate global color scale if enabled
     if use_fixed_colorscale:
         if "bfm_global_vmin" not in state or state.bfm_last_file != selected_file:
             magnitudes_full = np.abs(complex_matrix)
-            state.bfm_global_vmin = float(np.percentile(magnitudes_full, 2))
-            state.bfm_global_vmax = float(np.percentile(magnitudes_full, 98))
+            # Exclude zeros and very small values to get better color range for actual signals
+            nonzero_mags = magnitudes_full[magnitudes_full > 0.1]
+            if len(nonzero_mags) > 0:
+                # Use 5th and 95th percentile of non-zero values for better dynamic range
+                state.bfm_global_vmin = float(np.percentile(nonzero_mags, 5))
+                state.bfm_global_vmax = float(np.percentile(nonzero_mags, 95))
+            else:
+                # Fallback if no significant data
+                state.bfm_global_vmin = float(np.percentile(magnitudes_full, 2))
+                state.bfm_global_vmax = float(np.percentile(magnitudes_full, 98))
         global_vmin = state.bfm_global_vmin
         global_vmax = state.bfm_global_vmax
+        # Display current color scale
+        st.sidebar.caption(f"Color range: [{global_vmin:.2f}, {global_vmax:.2f}]")
     else:
         global_vmin = None
         global_vmax = None
+        st.sidebar.caption("Color range: Auto (per window)")
 
     # Subcarrier selection
     default_idx = np.linspace(0, len(subcarrier_values) - 1, num=4, dtype=int)
@@ -749,35 +839,37 @@ def main() -> None:
     # Timeline overview minimap
     st.markdown("---")
     st.markdown("## 🗺️ Timeline Overview")
-    st.pyplot(plot_timeline_overview(time_axis, temporal_profiles, highlight_idx, window_start, window_end))
+    fig = plot_timeline_overview(time_axis, temporal_profiles, highlight_idx, window_start, window_end)
+    st.pyplot(fig)
+    plt.close(fig)
 
     # Main visualizations
     st.markdown("---")
     st.markdown("## 📊 Temporal Analysis")
     col_time, col_constellation = st.columns((2, 1))
     with col_time:
-        st.pyplot(
-            plot_temporal_traces(
-                window_time,
-                complex_window,
-                highlight_indices,
-                subcarrier_choice,
-                highlight_time=highlight_window_time,
-            )
+        fig = plot_temporal_traces(
+            window_time,
+            complex_window,
+            highlight_indices,
+            subcarrier_choice,
+            highlight_time=highlight_window_time,
         )
+        st.pyplot(fig)
+        plt.close(fig)
     with col_constellation:
-        st.pyplot(
-            plot_constellation(
-                complex_window,
-                highlight_indices,
-                subcarrier_choice,
-                current_idx=highlight_local_idx,
-            )
+        fig = plot_constellation(
+            complex_window,
+            highlight_indices,
+            subcarrier_choice,
+            current_idx=highlight_local_idx,
         )
+        st.pyplot(fig)
+        plt.close(fig)
 
     st.markdown("---")
     st.markdown("## 🔥 Magnitude Heatmap")
-    st.pyplot(plot_heatmap(
+    fig = plot_heatmap(
         window_time,
         subcarrier_values,
         magnitude_window,
@@ -787,11 +879,16 @@ def main() -> None:
         smoothing=heatmap_smoothing,
         vmin=global_vmin,
         vmax=global_vmax,
-    ))
+        mask_zeros=mask_zeros,
+    )
+    st.pyplot(fig)
+    plt.close(fig)
 
     st.markdown("---")
     st.markdown("## 📈 Temporal Insights")
-    st.pyplot(plot_temporal_insights(window_time, window_profiles, highlight_time=highlight_window_time))
+    fig = plot_temporal_insights(window_time, window_profiles, highlight_time=highlight_window_time)
+    st.pyplot(fig)
+    plt.close(fig)
 
     # Advanced frequency analysis
     st.markdown("---")
@@ -805,14 +902,20 @@ def main() -> None:
 
     col_spec, col_doppler = st.columns(2)
     with col_spec:
-        st.pyplot(plot_spectrogram_analysis(window_time, complex_window, fs=effective_fs, cmap=cmap_choice))
+        fig = plot_spectrogram_analysis(window_time, complex_window, fs=effective_fs, cmap=cmap_choice)
+        st.pyplot(fig)
+        plt.close(fig)
     with col_doppler:
-        st.pyplot(plot_doppler_shift_analysis(complex_window, fs=effective_fs, cmap=cmap_choice))
+        fig = plot_doppler_shift_analysis(complex_window, fs=effective_fs, cmap=cmap_choice)
+        st.pyplot(fig)
+        plt.close(fig)
 
     # Motion analysis
     st.markdown("---")
     st.markdown("## 🎯 Motion Detection Analysis")
-    st.pyplot(plot_motion_analysis(time_axis, motion_metrics))
+    fig = plot_motion_analysis(time_axis, motion_metrics)
+    st.pyplot(fig)
+    plt.close(fig)
 
     # Expandable advanced views
     st.markdown("---")
@@ -822,11 +925,15 @@ def main() -> None:
 
     with col_exp1:
         with st.expander("🔵 Polar Snapshot (Current Frame)", expanded=False):
-            st.pyplot(plot_polar_snapshot(phases, magnitudes, subcarrier_values, highlight_idx))
+            fig = plot_polar_snapshot(phases, magnitudes, subcarrier_values, highlight_idx)
+            st.pyplot(fig)
+            plt.close(fig)
 
     with col_exp2:
         with st.expander("📡 Average Beamforming Envelope", expanded=False):
-            st.pyplot(plot_average_beam_pattern(complex_matrix, subcarrier_values))
+            fig = plot_average_beam_pattern(complex_matrix, subcarrier_values)
+            st.pyplot(fig)
+            plt.close(fig)
 
     with st.expander("📋 Raw Metadata Preview", expanded=False):
         meta_cols = [c for c in df.columns if not c.startswith("SCIDX_")]

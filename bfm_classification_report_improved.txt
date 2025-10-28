@@ -1,0 +1,24 @@
+BFM Model with Critical Fixes
+============================================================
+
+Improvements Applied:
+1. Sliding Windows (size=50, stride=10)
+2. Rolling Z-Score Normalization
+3. Magnitude/Phase Representation
+4. Median Filtering (window=9)
+
+Training Subjects: abel, collin, ivan, kenny
+Test Subjects: matthew
+Environment: open
+
+Test Accuracy: 0.8991
+Test Loss: 0.2803
+
+              precision    recall  f1-score   support
+
+    standing     0.9070    0.8886    0.8977       395
+     walking     0.8916    0.9095    0.9005       398
+
+    accuracy                         0.8991       793
+   macro avg     0.8993    0.8991    0.8991       793
+weighted avg     0.8993    0.8991    0.8991       793

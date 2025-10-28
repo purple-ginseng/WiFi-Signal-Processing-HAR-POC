@@ -19,8 +19,9 @@ class BFMCollector:
             password=None, 
             port=22, 
             local_pcap_dir="bfm_pcap", 
-            filename = 'bfm', 
-            filesize = 5
+            filename='bfm', 
+            filesize=5,
+            filecount=2
         ):
         """
         Initializes the collector with connection details.
@@ -30,6 +31,10 @@ class BFMCollector:
             username (str): The username for SSH login (e.g., 'root').
             password (str, optional): The password for the user.
             port (int, optional): The SSH port. Defaults to 22.
+            local_pcap_dir (str, optional): Directory where local pcaps are stored.
+            filename (str | Callable, optional): Base filename (or callable returning one).
+            filesize (int, optional): Maximum size in MB before tcpdump rotates files.
+            filecount (int, optional): Number of rotating capture files to keep on the router.
         """
         self.host = host
         self.username = username
@@ -41,6 +46,7 @@ class BFMCollector:
         self.filename = filename
         self.filecounter = -1
         self.local_pcap_dir = local_pcap_dir
+        self.filecount = max(1, int(filecount))
         self.pcap_collector_thread = None
         self._stop_event = threading.Event()
         self._processed_files = set() 
@@ -132,7 +138,7 @@ class BFMCollector:
     def slow(self):
         self._is_fast = False
 
-    def run_tcpdump(self):
+    def run_tcpdump(self, start_collector=True):
         """
         Starts tcpdump to capture packets on the remote device.
 
@@ -148,8 +154,14 @@ class BFMCollector:
         file_prefix = "bfm_capture"
         remote_path_prefix = f"/tmp/{file_prefix}"
 
+        tcpdump_started = False
+
         if not self._is_fast:
-            command = f"tcpdump -i mon0 -p -w {remote_path_prefix} -W 2 -C {self.filesize} 'wlan[24] == 21' > /dev/null 2>&1 &"
+            command = (
+                f"tcpdump -i mon0 -p -w {remote_path_prefix} "
+                f"-W {self.filecount} -C {self.filesize} "
+                "'wlan[24] == 21' > /dev/null 2>&1 &"
+            )
         else:
             command = f"tcpdump -i mon0 -w {remote_path_prefix} -G 1 'wlan[24] == 21' > /dev/null 2>&1 &"
 
@@ -189,7 +201,7 @@ class BFMCollector:
 
             if setup_error:
                 print(f"❌ Failed to bring mon0 up. Error: {setup_error}")
-                return # Abort if we can't set up the interface
+                raise RuntimeError("Unable to bring mon0 up after tcpdump failure.")
 
             print("✅ Interface reset complete. Retrying tcpdump...")
             
@@ -202,12 +214,18 @@ class BFMCollector:
             
             if output:
                 print(f"✅ tcpdump started successfully with PID {output} after interface reset.")
+                tcpdump_started = True
             else:
                 print("❌ tcpdump failed on the second attempt. Please check the router's logs.")
+                raise RuntimeError("tcpdump failed to start after interface reset.")
         else:
             print(f"✅ tcpdump started successfully on the first attempt with PID {output}.")
+            tcpdump_started = True
         
-        self.start_pcap_collection()
+        if tcpdump_started and start_collector:
+            self.start_pcap_collection()
+
+        return tcpdump_started
 
     def kill_tcpdump(self):
         self.run_command("killall tcpdump")
@@ -305,28 +323,67 @@ class BFMCollector:
             print(f"[Collector Thread] Failed to open SFTP session: {e}")
             return # Exit thread if SFTP fails
 
+        stable_candidates = {}
+
         while not self._stop_event.is_set():
             try:
                 remote_files = sftp.listdir('/tmp/')
                 pcap_files = [f for f in remote_files if f.startswith('bfm_capture')]
                 
                 # We need two files to determine which one is "complete"
-                if len(pcap_files) < 2:
-                    time.sleep(2) # Wait for tcpdump to create both files
+                if not pcap_files:
+                    stable_candidates.clear()
+                    time.sleep(2)
                     continue
 
-                # Get file modification times to find the older one (the one not being written to)
+                now = time.time()
                 file_stats = []
                 for f in pcap_files:
                     path = f"/tmp/{f}"
                     stat = sftp.stat(path)
-                    file_stats.append({'path': path, 'mtime': stat.st_mtime})
+                    file_stats.append({'path': path, 'mtime': stat.st_mtime, 'size': stat.st_size})
 
                 # Sort by modification time to find the oldest file
                 file_stats.sort(key=lambda x: x['mtime'])
-                completed_file = file_stats[0] # The oldest file is the completed one
 
-                if completed_file['path'] not in self._processed_files:
+                candidates = []
+
+                if len(file_stats) >= 2:
+                    # When tcpdump is rotating, the oldest file is safe to download
+                    oldest = file_stats[0]
+                    candidates.append(oldest)
+                    # Reset stability tracker for the file currently being written
+                    active_path = file_stats[-1]['path']
+                    stable_candidates = {k: v for k, v in stable_candidates.items() if k == active_path}
+                else:
+                    # Only one file available. Wait until it stays unchanged for a few cycles.
+                    sole = file_stats[0]
+                    state = stable_candidates.get(sole['path'])
+                    if state and state['mtime'] == sole['mtime'] and state['size'] == sole['size']:
+                        state['stable_checks'] += 1
+                        state['last_seen'] = now
+                    else:
+                        stable_candidates[sole['path']] = {
+                            'mtime': sole['mtime'],
+                            'size': sole['size'],
+                            'stable_checks': 1,
+                            'last_seen': now
+                        }
+
+                    # Promote to candidate after a few consecutive stable observations (> ~6 seconds)
+                    state = stable_candidates[sole['path']]
+                    if state['stable_checks'] >= 3 and state['size'] > 0:
+                        candidates.append(sole)
+
+                    # Drop stale entries not seen recently
+                    stale_keys = [k for k, v in stable_candidates.items() if now - v['last_seen'] > 30]
+                    for key in stale_keys:
+                        stable_candidates.pop(key, None)
+
+                for completed_file in candidates:
+                    if completed_file['path'] in self._processed_files:
+                        continue
+
                     local_path = os.path.join(self.local_pcap_dir, self.get_filename())
                     print(f"[Collector Thread] New file found: {completed_file['path']}. Downloading...")
                     
@@ -339,6 +396,7 @@ class BFMCollector:
                     # 3. Mark it as processed
                     self._processed_files.add(completed_file['path'])
                     self._collected_files.add(local_path)
+                    stable_candidates.pop(completed_file['path'], None)
                     print(f"[Collector Thread] ✅ Download complete. Deleted remote file.")
 
             except Exception as e:

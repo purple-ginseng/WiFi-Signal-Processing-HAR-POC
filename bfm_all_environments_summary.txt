@@ -1,0 +1,26 @@
+BFM Model Training - All Environments Summary
+======================================================================
+
+Train Subjects: abel, collin, ivan, kenny
+Test Subjects: matthew
+
+Environment Accuracy   Loss Standing Precision Standing Recall Walking Precision Walking Recall
+     nofoil   0.8002 0.6248             0.8311          0.7512            0.7751         0.8488
+       foil   0.6116 0.7017             0.5709          0.7098            0.6692         0.5239
+       open   0.8777 0.3015             0.8880          0.8633            0.8680         0.8920
+
+
+NOFOIL:
+----------------------------------------
+  Accuracy: 0.8002
+  Loss: 0.6248
+
+FOIL:
+----------------------------------------
+  Accuracy: 0.6116
+  Loss: 0.7017
+
+OPEN:
+----------------------------------------
+  Accuracy: 0.8777
+  Loss: 0.3015

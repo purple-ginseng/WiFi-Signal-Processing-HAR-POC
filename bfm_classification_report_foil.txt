@@ -1,0 +1,21 @@
+BFM Model Classification Report - FOIL Environment
+======================================================================
+
+Configuration:
+  Environment: foil
+  Train Subjects: abel, collin, ivan, kenny
+  Test Subjects: matthew
+  Window Size: 50
+  PCA Components: 5
+
+Test Accuracy: 0.6116
+Test Loss: 0.7017
+
+              precision    recall  f1-score   support
+
+    standing     0.5709    0.7098    0.6328       448
+     walking     0.6692    0.5239    0.5877       502
+
+    accuracy                         0.6116       950
+   macro avg     0.6201    0.6169    0.6103       950
+weighted avg     0.6229    0.6116    0.6090       950

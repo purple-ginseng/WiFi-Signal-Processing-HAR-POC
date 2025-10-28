@@ -1,0 +1,21 @@
+BFM Model Classification Report - OPEN Environment
+======================================================================
+
+Configuration:
+  Environment: open
+  Train Subjects: abel, collin, ivan, kenny
+  Test Subjects: matthew
+  Window Size: 50
+  PCA Components: 5
+
+Test Accuracy: 0.8777
+Test Loss: 0.3015
+
+              precision    recall  f1-score   support
+
+    standing     0.8880    0.8633    0.8755       395
+     walking     0.8680    0.8920    0.8798       398
+
+    accuracy                         0.8777       793
+   macro avg     0.8780    0.8776    0.8776       793
+weighted avg     0.8780    0.8777    0.8776       793

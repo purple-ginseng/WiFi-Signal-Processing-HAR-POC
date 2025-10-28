@@ -1,0 +1,21 @@
+BFM Doppler Model Classification Report - NOFOIL
+======================================================================
+
+Configuration:
+  Method: Doppler Shift Features
+  Window Size: 5 packets
+  Stride: 1 packet
+  Train Subjects: abel, collin, ivan, kenny
+  Test Subjects: matthew
+
+Test Accuracy: 0.6621
+Test Loss: 0.7284
+
+              precision    recall  f1-score   support
+
+    standing     0.6941    0.5754    0.6292      4767
+     walking     0.6395    0.7481    0.6896      4800
+
+    accuracy                         0.6621      9567
+   macro avg     0.6668    0.6618    0.6594      9567
+weighted avg     0.6667    0.6621    0.6595      9567

@@ -1,0 +1,15 @@
+BFM Model Classification Report
+Training Set: abel, collin, ivan
+Test Set: kenny, matthew
+
+Test Accuracy: 0.5544
+Test Loss: 0.7437
+
+              precision    recall  f1-score   support
+
+    standing     0.5363    0.7823    0.6364     10212
+     walking     0.6025    0.3279    0.4247     10277
+
+    accuracy                         0.5544     20489
+   macro avg     0.5694    0.5551    0.5305     20489
+weighted avg     0.5695    0.5544    0.5302     20489

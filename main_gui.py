@@ -43,7 +43,25 @@ PCA_COMPONENTS= 50
 TEST_SIZE     = 0.3
 EPOCHS        = 20
 BATCH_SIZE_TF = 32
-TSHARK_PATH = r'C:\Program Files\Wireshark\tshark.exe'
+# Auto-detect tshark path based on platform
+if platform.system() == "Windows":
+    TSHARK_PATH = r'C:\Program Files\Wireshark\tshark.exe'
+elif platform.system() == "Darwin":  # macOS
+    # Check common macOS locations for tshark
+    possible_paths = [
+        '/Applications/Wireshark.app/Contents/MacOS/tshark',  # Wireshark.app bundle
+        '/usr/local/bin/tshark',  # Homebrew installation
+        '/opt/homebrew/bin/tshark'  # Apple Silicon Homebrew
+    ]
+    TSHARK_PATH = None
+    for path in possible_paths:
+        if os.path.exists(path):
+            TSHARK_PATH = path
+            break
+    if TSHARK_PATH is None:
+        TSHARK_PATH = '/usr/local/bin/tshark'  # Default fallback
+else:  # Linux
+    TSHARK_PATH = '/usr/bin/tshark'
 # ───────────────────────────────────────────────────────────────────────────────
 
 class MainApp(tk.Tk):
