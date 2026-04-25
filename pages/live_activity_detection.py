@@ -56,7 +56,7 @@ BUFFER_SIZE = 100  # Keep last N packets in memory
 RETRY_INTERVAL = 2.0  # Seconds between connection retries
 
 # Traffic generation settings
-ENABLE_TRAFFIC_GENERATION = True  # Set to True for bistatic, False for monostatic (mobile phone)
+ENABLE_TRAFFIC_GENERATION = True  # Set to True for self ping, False for (mobile phone)
 # If False: Relies on natural WiFi traffic from devices (phone, laptop, etc.)
 # If True: Router generates its own traffic (100 Hz ping + iperf3) for testing
 
@@ -219,9 +219,9 @@ class LiveDataCollector:
 
                     print("[Connection] Starting high-rate ping for more traffic...")
                     self.bfm_collector.run_command("ping -i 0.01 192.168.1.1 > /dev/null 2>&1 &")
-                    print("[Connection] ✅ Traffic generation enabled (bistatic mode)")
+                    print("[Connection] ✅ Traffic generation enabled ")
                 else:
-                    print("[Connection] ⚠️ Traffic generation DISABLED (monostatic mode)")
+                    print("[Connection] ⚠️ Traffic generation DISABLED ")
                     print("[Connection] Relying on natural WiFi traffic from devices (phone, etc.)")
 
                 # Start tcpdump via collector (raises if startup fails)
@@ -1172,9 +1172,9 @@ def main():
 
     # Traffic mode indicator
     if ENABLE_TRAFFIC_GENERATION:
-        st.sidebar.info("🔄 **Traffic Mode:** Bistatic\n\n Router generates its own traffic (ping + iperf3)")
+        st.sidebar.info("🔄 **Traffic Mode:** \n\n Router generates its own traffic (ping + iperf3)")
     else:
-        st.sidebar.warning("📱 **Traffic Mode:** Monostatic\n\nRelying on natural device traffic (phone, etc.)\n\n⚠️ Make sure device is actively using WiFi!")
+        st.sidebar.warning("📱 **Traffic Mode:** \n\nRelying on natural device traffic (phone, etc.)\n\n⚠️ Make sure device is actively using WiFi!")
 
     st.sidebar.markdown("---")
 

@@ -17,6 +17,9 @@ from matplotlib.colors import Normalize
 from matplotlib.ticker import MaxNLocator
 from scipy.signal import spectrogram, detrend
 from scipy.ndimage import gaussian_filter, uniform_filter1d
+from scipy.stats.mstats import winsorize
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 
 # Disable matplotlib warnings
 import warnings
@@ -136,6 +139,240 @@ def plot_temporal_traces(
     ax.legend(ncol=2, fontsize="small", loc="upper right")
     if highlight_time is not None:
         ax.axvline(highlight_time, color="#ff4d4f", linestyle="--", linewidth=1.2, alpha=0.8)
+    return fig
+
+
+def plot_phase_traces(
+    time_axis: np.ndarray,
+    complex_samples: np.ndarray,
+    column_indices: list[int],
+    labels: list[int],
+    highlight_time: Optional[float] = None,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(8, 3))
+    phases = np.unwrap(np.angle(complex_samples), axis=0)
+    for pos, label in zip(column_indices, labels):
+        ax.plot(time_axis, phases[:, pos], label=f"SC {label}")
+    ax.set_title("Temporal Phase Traces")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Phase (rad)")
+    ax.grid(True, alpha=0.3)
+    ax.legend(ncol=2, fontsize="small", loc="upper right")
+    if highlight_time is not None:
+        ax.axvline(highlight_time, color="#ff4d4f", linestyle="--", linewidth=1.2, alpha=0.8)
+    return fig
+
+
+def plot_pca_traces(
+    time_axis: np.ndarray,
+    complex_samples: np.ndarray,
+    highlight_time: Optional[float] = None,
+) -> plt.Figure:
+    """Plot PCA n=1 for both magnitude and phase"""
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
+
+    # Magnitude PCA
+    magnitudes = np.abs(complex_samples)
+    if magnitudes.shape[0] > 1 and magnitudes.shape[1] > 1:
+        pca_mag = PCA(n_components=1)
+        mag_pca = pca_mag.fit_transform(magnitudes)
+        ax1.plot(time_axis, mag_pca[:, 0], 'b-', linewidth=1.5)
+        ax1.set_title(f"Magnitude PCA (n=1) - Explained Var: {pca_mag.explained_variance_ratio_[0]*100:.1f}%")
+    else:
+        ax1.plot(time_axis, np.mean(magnitudes, axis=1), 'b-', linewidth=1.5)
+        ax1.set_title("Magnitude Mean (insufficient data for PCA)")
+    ax1.set_ylabel("PC1 (Magnitude)")
+    ax1.grid(True, alpha=0.3)
+    if highlight_time is not None:
+        ax1.axvline(highlight_time, color="#ff4d4f", linestyle="--", linewidth=1.2, alpha=0.8)
+
+    # Phase PCA
+    phases = np.unwrap(np.angle(complex_samples), axis=0)
+    phases = np.nan_to_num(phases, nan=0.0, posinf=0.0, neginf=0.0)
+    if phases.shape[0] > 1 and phases.shape[1] > 1:
+        pca_phase = PCA(n_components=1)
+        phase_pca = pca_phase.fit_transform(phases)
+        ax2.plot(time_axis, phase_pca[:, 0], 'g-', linewidth=1.5)
+        ax2.set_title(f"Phase PCA (n=1) - Explained Var: {pca_phase.explained_variance_ratio_[0]*100:.1f}%")
+    else:
+        ax2.plot(time_axis, np.mean(phases, axis=1), 'g-', linewidth=1.5)
+        ax2.set_title("Phase Mean (insufficient data for PCA)")
+    ax2.set_ylabel("PC1 (Phase)")
+    ax2.set_xlabel("Time (s)")
+    ax2.grid(True, alpha=0.3)
+    if highlight_time is not None:
+        ax2.axvline(highlight_time, color="#ff4d4f", linestyle="--", linewidth=1.2, alpha=0.8)
+
+    fig.suptitle("PCA Analysis (n=1)", y=0.98, fontweight='bold')
+    fig.tight_layout()
+    return fig
+
+
+def compute_engineered_features(
+    complex_samples: np.ndarray,
+    winsorize_limits: tuple[float, float] = (0.05, 0.05),
+) -> dict[str, np.ndarray]:
+    """
+    Compute 2D feature vectors using temporal feature engineering:
+    1. Winsorize - clip extreme values to reduce outlier impact
+    2. Standardize - zero mean, unit variance
+    3. Accelerate - second derivative to capture motion dynamics
+
+    Returns magnitude and phase PCA features after engineering.
+    """
+    # Get magnitude and phase from complex samples
+    magnitudes = np.abs(complex_samples)
+    phases = np.unwrap(np.angle(complex_samples), axis=0)
+    phases = np.nan_to_num(phases, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Apply PCA (n=1) first to get 1D time series
+    if magnitudes.shape[0] > 1 and magnitudes.shape[1] > 1:
+        pca_mag = PCA(n_components=1)
+        mag_pca = pca_mag.fit_transform(magnitudes).flatten()
+        pca_phase = PCA(n_components=1)
+        phase_pca = pca_phase.fit_transform(phases).flatten()
+    else:
+        mag_pca = np.mean(magnitudes, axis=1)
+        phase_pca = np.mean(phases, axis=1)
+
+    # 1. Winsorize - clip extreme values
+    mag_winsorized = np.array(winsorize(mag_pca, limits=winsorize_limits))
+    phase_winsorized = np.array(winsorize(phase_pca, limits=winsorize_limits))
+
+    # 2. Standardize - zero mean, unit variance
+    scaler = StandardScaler()
+    if len(mag_winsorized) > 1:
+        mag_standardized = scaler.fit_transform(mag_winsorized.reshape(-1, 1)).flatten()
+        phase_standardized = scaler.fit_transform(phase_winsorized.reshape(-1, 1)).flatten()
+    else:
+        mag_standardized = mag_winsorized
+        phase_standardized = phase_winsorized
+
+    # 3. Accelerate - second derivative (acceleration)
+    if len(mag_standardized) > 2:
+        # First derivative (velocity)
+        mag_velocity = np.gradient(mag_standardized)
+        phase_velocity = np.gradient(phase_standardized)
+        # Second derivative (acceleration)
+        mag_acceleration = np.gradient(mag_velocity)
+        phase_acceleration = np.gradient(phase_velocity)
+    else:
+        mag_acceleration = np.zeros_like(mag_standardized)
+        phase_acceleration = np.zeros_like(phase_standardized)
+
+    return {
+        "mag_raw": mag_pca,
+        "phase_raw": phase_pca,
+        "mag_winsorized": mag_winsorized,
+        "phase_winsorized": phase_winsorized,
+        "mag_standardized": mag_standardized,
+        "phase_standardized": phase_standardized,
+        "mag_acceleration": mag_acceleration,
+        "phase_acceleration": phase_acceleration,
+    }
+
+
+def plot_2d_feature_vector(
+    time_axis: np.ndarray,
+    features: dict[str, np.ndarray],
+    highlight_time: Optional[float] = None,
+    highlight_idx: Optional[int] = None,
+) -> plt.Figure:
+    """
+    Plot 2D feature vector visualization:
+    - Left: Time series of engineered features
+    - Right: 2D scatter plot (magnitude vs phase features)
+    """
+    fig = plt.figure(figsize=(16, 10))
+
+    # Create grid for subplots with more spacing
+    gs = fig.add_gridspec(3, 2, width_ratios=[2, 1], hspace=0.45, wspace=0.35,
+                          left=0.08, right=0.95, top=0.90, bottom=0.08)
+
+    # Left column: Time series at each processing stage
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+    ax3 = fig.add_subplot(gs[2, 0], sharex=ax1)
+
+    # Right column: 2D scatter plots
+    ax4 = fig.add_subplot(gs[0, 1])
+    ax5 = fig.add_subplot(gs[1, 1])
+    ax6 = fig.add_subplot(gs[2, 1])
+
+    # Time series plots
+    # 1. Raw PCA features
+    ax1.plot(time_axis, features["mag_raw"], 'b-', linewidth=1, label='Magnitude PC1', alpha=0.8)
+    ax1.plot(time_axis, features["phase_raw"], 'g-', linewidth=1, label='Phase PC1', alpha=0.8)
+    ax1.set_ylabel("Raw PCA")
+    ax1.set_title("Stage 1: Raw PCA Features", fontweight='bold')
+    ax1.legend(loc='upper right', fontsize=8)
+    ax1.grid(True, alpha=0.3)
+    if highlight_time is not None:
+        ax1.axvline(highlight_time, color="#ff4d4f", linestyle="--", linewidth=1.5, alpha=0.8)
+
+    # 2. Winsorized + Standardized
+    ax2.plot(time_axis, features["mag_standardized"], 'b-', linewidth=1, label='Magnitude', alpha=0.8)
+    ax2.plot(time_axis, features["phase_standardized"], 'g-', linewidth=1, label='Phase', alpha=0.8)
+    ax2.set_ylabel("Standardized")
+    ax2.set_title("Stage 2: Winsorized + Standardized", fontweight='bold')
+    ax2.legend(loc='upper right', fontsize=8)
+    ax2.grid(True, alpha=0.3)
+    if highlight_time is not None:
+        ax2.axvline(highlight_time, color="#ff4d4f", linestyle="--", linewidth=1.5, alpha=0.8)
+
+    # 3. Acceleration (2nd derivative)
+    ax3.plot(time_axis, features["mag_acceleration"], 'b-', linewidth=1, label='Magnitude Accel', alpha=0.8)
+    ax3.plot(time_axis, features["phase_acceleration"], 'orange', linewidth=1, label='Phase Accel', alpha=0.8)
+    ax3.set_ylabel("Acceleration")
+    ax3.set_xlabel("Time (s)")
+    ax3.set_title("Stage 3: Acceleration (2nd Derivative)", fontweight='bold')
+    ax3.legend(loc='upper right', fontsize=8)
+    ax3.grid(True, alpha=0.3)
+    if highlight_time is not None:
+        ax3.axvline(highlight_time, color="#ff4d4f", linestyle="--", linewidth=1.5, alpha=0.8)
+
+    # 2D Scatter plots
+    # Color by time for trajectory visualization
+    colors = np.arange(len(time_axis))
+
+    # 1. Raw features 2D
+    scatter1 = ax4.scatter(features["mag_raw"], features["phase_raw"],
+                           c=colors, cmap='viridis', s=10, alpha=0.6)
+    if highlight_idx is not None and highlight_idx < len(features["mag_raw"]):
+        ax4.scatter(features["mag_raw"][highlight_idx], features["phase_raw"][highlight_idx],
+                   c='red', s=100, marker='x', linewidths=2, zorder=5)
+    ax4.set_xlabel("Magnitude PC1")
+    ax4.set_ylabel("Phase PC1")
+    ax4.set_title("2D: Raw Features", fontweight='bold')
+    ax4.grid(True, alpha=0.3)
+
+    # 2. Standardized features 2D
+    scatter2 = ax5.scatter(features["mag_standardized"], features["phase_standardized"],
+                           c=colors, cmap='viridis', s=10, alpha=0.6)
+    if highlight_idx is not None and highlight_idx < len(features["mag_standardized"]):
+        ax5.scatter(features["mag_standardized"][highlight_idx], features["phase_standardized"][highlight_idx],
+                   c='red', s=100, marker='x', linewidths=2, zorder=5)
+    ax5.set_xlabel("Magnitude (std)")
+    ax5.set_ylabel("Phase (std)")
+    ax5.set_title("2D: Standardized", fontweight='bold')
+    ax5.grid(True, alpha=0.3)
+
+    # 3. Acceleration features 2D (final 2D feature vector)
+    scatter3 = ax6.scatter(features["mag_acceleration"], features["phase_acceleration"],
+                           c=colors, cmap='plasma', s=15, alpha=0.7)
+    if highlight_idx is not None and highlight_idx < len(features["mag_acceleration"]):
+        ax6.scatter(features["mag_acceleration"][highlight_idx], features["phase_acceleration"][highlight_idx],
+                   c='red', s=100, marker='x', linewidths=2, zorder=5)
+    ax6.set_xlabel("Magnitude Acceleration")
+    ax6.set_ylabel("Phase Acceleration")
+    ax6.set_title("2D Feature Vector (Final)", fontweight='bold')
+    ax6.grid(True, alpha=0.3)
+
+    # Add colorbar for time
+    cbar = fig.colorbar(scatter3, ax=ax6, label='Time index')
+
+    fig.suptitle("2D Feature Engineering: Winsorize → Standardize → Accelerate",
+                 y=0.96, fontsize=13, fontweight='bold')
     return fig
 
 
@@ -846,8 +1083,10 @@ def main() -> None:
     # Main visualizations
     st.markdown("---")
     st.markdown("## 📊 Temporal Analysis")
-    col_time, col_constellation = st.columns((2, 1))
-    with col_time:
+
+    # Magnitude traces
+    col_mag, col_constellation = st.columns((2, 1))
+    with col_mag:
         fig = plot_temporal_traces(
             window_time,
             complex_window,
@@ -866,6 +1105,40 @@ def main() -> None:
         )
         st.pyplot(fig)
         plt.close(fig)
+
+    # Phase traces
+    st.markdown("### Phase Time Series")
+    fig = plot_phase_traces(
+        window_time,
+        complex_window,
+        highlight_indices,
+        subcarrier_choice,
+        highlight_time=highlight_window_time,
+    )
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # PCA Analysis
+    st.markdown("### PCA Analysis (n=1)")
+    fig = plot_pca_traces(
+        window_time,
+        complex_window,
+        highlight_time=highlight_window_time,
+    )
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # 2D Feature Vector with Temporal Engineering
+    st.markdown("### 2D Feature Vector (Engineered)")
+    engineered_features = compute_engineered_features(complex_window)
+    fig = plot_2d_feature_vector(
+        window_time,
+        engineered_features,
+        highlight_time=highlight_window_time,
+        highlight_idx=highlight_local_idx,
+    )
+    st.pyplot(fig)
+    plt.close(fig)
 
     st.markdown("---")
     st.markdown("## 🔥 Magnitude Heatmap")
