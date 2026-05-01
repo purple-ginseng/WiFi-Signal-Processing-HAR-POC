@@ -24,9 +24,12 @@ from matplotlib.figure import Figure
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
 
-# Import from project modules
+# Import from project modules — make the path setup robust regardless of how
+# Streamlit / Python launches this file (cwd may not be the project root).
 import sys
-sys.path.append(str(Path(__file__).parent.parent))
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from bfmtool.collector import BFMCollector
 from bfmtool.extractor import BFMExtractor
