@@ -183,13 +183,13 @@ class LiveDataCollector:
         # Stall-detection watchdog: if total bytes across /tmp/bfm_capture*
         # don't change for STALL_THRESHOLD seconds, the explicit tcpdump
         # command is re-issued on the router.
-        self.STALL_THRESHOLD = 1.0
+        self.STALL_THRESHOLD = 0.5
         self._last_total_bytes = -1
         self._last_growth_ts = 0.0
         self._tcpdump_cmd = (
             "killall tcpdump 2>/dev/null; "
             "rm -f /tmp/bfm_capture*; "
-            "tcpdump -i mon0 -p -U -G 1 -W 10 -w /tmp/bfm_capture "
+            "tcpdump -i mon0 -p -U -B 4096 -G 1 -W 10 -w /tmp/bfm_capture "
             "'wlan[24] == 21' > /dev/null 2>&1 &"  # wlan[24] == 21, (wlan[0] & 0xfc) == 0xd0
         )
 
@@ -384,8 +384,8 @@ class LiveDataCollector:
             try:
                 loop_count += 1
 
-                # Every 25 loops (~5 seconds), verify tcpdump is still running
-                if loop_count % 25 == 0:
+                # Every 10 loops (~1 second @ 0.1s sleep), verify tcpdump is still running
+                if loop_count % 10 == 0:
                     try:
                         output, _ = self.bfm_collector.run_command(
                             "pgrep -f 'tcpdump -i mon0'"
@@ -432,7 +432,7 @@ class LiveDataCollector:
                         print(f"[Download] Files in /tmp/ (sample): {tmp_files_sample}")
                         processed_files.clear()
                         single_file_tracker.clear()
-                        time.sleep(0.3)
+                        time.sleep(0.1)
                         sftp.close()
                         continue
 
@@ -457,7 +457,7 @@ class LiveDataCollector:
 
                     if not file_stats:
                         print("[Download] No valid file stats collected")
-                        time.sleep(0.3)
+                        time.sleep(0.1)
                         sftp.close()
                         continue
 
@@ -522,15 +522,15 @@ class LiveDataCollector:
                                 f"[Download] Single file {sole['path'].split('/')[-1]} tracking started (size: {sole['size']} bytes)"
                             )
 
-                        # Reduced from 3 to 2 for faster response
-                        if tracker["stable_checks"] >= 2 and tracker["size"] > 0:
+                        # 1 check: download immediately if non-empty (highest sensitivity)
+                        if tracker["stable_checks"] >= 1 and tracker["size"] > 100:
                             print(
                                 f"[Download] Single file {sole['path'].split('/')[-1]} is stable, adding to candidates"
                             )
                             candidates.append(sole)
                         else:
                             print(
-                                f"[Download] Single file {sole['path'].split('/')[-1]} not yet stable ({tracker['stable_checks']}/2 checks)"
+                                f"[Download] Single file {sole['path'].split('/')[-1]} not yet stable ({tracker['stable_checks']}/1 checks, size {sole['size']}B)"
                             )
 
                     print(f"[Download] Candidates for download: {len(candidates)}")
@@ -589,7 +589,7 @@ class LiveDataCollector:
                 except Exception as e:
                     print(f"[Download] SFTP error: {e}")
 
-                time.sleep(0.2)  # Check 5 times per second for new files
+                time.sleep(0.1)  # Check 10 times per second for new files
 
             except Exception as e:
                 print(f"[Download] Error: {e}")

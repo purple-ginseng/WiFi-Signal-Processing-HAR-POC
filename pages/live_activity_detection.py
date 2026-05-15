@@ -178,6 +178,19 @@ class LiveDataCollector:
         self.total_processed = 0
         self.total_packets = 0
 
+        # Stall-detection watchdog: if total bytes across /tmp/bfm_capture*
+        # don't change for STALL_THRESHOLD seconds, re-issue the explicit
+        # tcpdump command on the router.
+        self.STALL_THRESHOLD = 0.5
+        self._last_total_bytes = -1
+        self._last_growth_ts = 0.0
+        self._tcpdump_cmd = (
+            "killall tcpdump 2>/dev/null; "
+            "rm -f /tmp/bfm_capture*; "
+            "tcpdump -i mon0 -p -U -B 4096 -G 1 -W 10 -w /tmp/bfm_capture "
+            "'wlan[24] == 21' > /dev/null 2>&1 &"
+        )
+
         # Create directories for BFM pipeline
         import os
         os.makedirs('live_bfm_pcap', exist_ok=True)
@@ -194,6 +207,38 @@ class LiveDataCollector:
             dir='live_bfm_processed_csv'
         )
 
+    def _launch_tcpdump_explicit(self, verify=True):
+        """
+        Issue the saved explicit tcpdump command on the router. Returns True
+        if `ps w | grep '[t]cpdump'` shows the process within 1 s.
+        Uses time-based rotation (-G 1 -W 10) for sub-second freshness and -U
+        for unbuffered packet flush.
+        """
+        if self.bfm_collector is None or self.bfm_collector.client is None:
+            return False
+        print(f"[tcpdump] Issuing: {self._tcpdump_cmd}")
+        try:
+            self.bfm_collector.run_command(self._tcpdump_cmd)
+        except Exception as e:
+            print(f"[tcpdump] run_command failed: {e}")
+            return False
+        if not verify:
+            return True
+        time.sleep(1)
+        try:
+            ps_out, _ = self.bfm_collector.run_command("ps w | grep '[t]cpdump'")
+        except Exception as e:
+            print(f"[tcpdump] verify failed: {e}")
+            return False
+        if not ps_out:
+            print("[tcpdump] ❌ not running after issue.")
+            return False
+        print(f"[tcpdump] ✅ running:\n  {ps_out}")
+        # Reset stall watchdog so it doesn't re-fire immediately
+        self._last_total_bytes = -1
+        self._last_growth_ts = time.time()
+        return True
+
     def _connect_with_retry(self):
         """Connect to router with retry logic every 2 seconds"""
         while self.running and not self.connected:
@@ -201,14 +246,16 @@ class LiveDataCollector:
                 print(f"[Connection] Attempting to connect to {self.host}...")
                 self.connection_status = "Connecting..."
 
-                # Create fresh BFMCollector with optimized settings
+                # Create fresh BFMCollector. Explicit tcpdump command below uses
+                # time-based rotation (-G 1 -W 10) so filesize is unused; filecount
+                # matches the ring buffer size.
                 self.bfm_collector = BFMCollector(
                     host=self.host,
                     username=self.user,
                     password=self.password,
                     local_pcap_dir='live_bfm_pcap',
                     filename='live_bfm',
-                    filesize=1,  # 1MB files (0.1 was too small for tcpdump)
+                    filesize=1,
                     filecount=10
                 )
 
@@ -220,26 +267,20 @@ class LiveDataCollector:
                     print("[Connection] Starting iperf3 traffic generator...")
                     self.bfm_collector.run_iperf3()
 
-                    print("[Connection] Starting high-rate ping for more traffic...")
-                    self.bfm_collector.run_command("ping -i 0.01 192.168.1.1 > /dev/null 2>&1 &")
+                    print("[Connection] Starting 1 kHz ping for more traffic...")
+                    self.bfm_collector.run_command("ping -i 0.001 192.168.1.1 > /dev/null 2>&1 &")
                     print("[Connection] ✅ Traffic generation enabled ")
                 else:
                     print("[Connection] ⚠️ Traffic generation DISABLED ")
                     print("[Connection] Relying on natural WiFi traffic from devices (phone, etc.)")
 
-                # Start tcpdump via collector (raises if startup fails)
-                print("[Connection] Starting tcpdump (1MB rotation, 10 files)...")
-                tcpdump_ok = self.bfm_collector.run_tcpdump(start_collector=False)
-                if not tcpdump_ok:
-                    raise RuntimeError("tcpdump did not report a successful startup")
+                # Wait 5 s after traffic-gen so iperf3+ping settle before capture.
+                print("[Connection] Waiting 5 s before starting tcpdump...")
+                time.sleep(5)
 
-                # Verify tcpdump is actually running
-                print("[Connection] Verifying tcpdump process...")
-                output, _ = self.bfm_collector.run_command("pgrep -f 'tcpdump -i mon0'")
-                if output:
-                    print(f"[Connection] ✅ tcpdump verified running (PID: {output.strip()})")
-                else:
-                    print("[Connection] ⚠️ Warning: tcpdump PID not found, but startup reported success")
+                # Launch tcpdump with explicit -G 1 -W 10 -U command.
+                if not self._launch_tcpdump_explicit(verify=True):
+                    raise RuntimeError("tcpdump did not start after 5-s settle")
 
                 self.connected = True
                 self.connection_status = "Connected ✓"
@@ -332,15 +373,15 @@ class LiveDataCollector:
             try:
                 loop_count += 1
 
-                # Every 25 loops (~5 seconds), verify tcpdump is still running
-                if loop_count % 25 == 0:
+                # Every 10 loops (~1 second @ 0.1s sleep), verify tcpdump is still running
+                if loop_count % 10 == 0:
                     try:
                         output, _ = self.bfm_collector.run_command("pgrep -f 'tcpdump -i mon0'")
                         if output:
                             print(f"[Download] tcpdump health check OK (PID: {output.strip()})")
                         else:
                             print("[Download] ⚠️ tcpdump NOT running! Attempting to restart...")
-                            self.bfm_collector.run_tcpdump(start_collector=False)
+                            self._launch_tcpdump_explicit(verify=True)
                     except Exception as e:
                         print(f"[Download] tcpdump health check failed: {e}")
 
@@ -366,7 +407,7 @@ class LiveDataCollector:
                         print(f"[Download] Files in /tmp/ (sample): {tmp_files_sample}")
                         processed_files.clear()
                         single_file_tracker.clear()
-                        time.sleep(0.3)
+                        time.sleep(0.1)
                         sftp.close()
                         continue
 
@@ -389,12 +430,31 @@ class LiveDataCollector:
 
                     if not file_stats:
                         print("[Download] No valid file stats collected")
-                        time.sleep(0.3)
+                        time.sleep(0.1)
                         sftp.close()
                         continue
 
                     file_stats.sort(key=lambda x: x['mtime'])
                     print(f"[Download] File stats: {[(f['path'].split('/')[-1], f['size'], 'bytes') for f in file_stats]}")
+
+                    # ─── Stall watchdog ────────────────────────────────────
+                    # If total bytes across all bfm_capture* on the router have
+                    # not grown for STALL_THRESHOLD seconds, re-issue the
+                    # explicit tcpdump command. Catches silent tcpdump death,
+                    # mon0 dropout, or client disassociation.
+                    total_bytes = sum(f['size'] for f in file_stats)
+                    now = time.time()
+                    if total_bytes != self._last_total_bytes:
+                        self._last_total_bytes = total_bytes
+                        self._last_growth_ts = now
+                    elif now - self._last_growth_ts >= self.STALL_THRESHOLD:
+                        idle = now - self._last_growth_ts
+                        print(f"[Watchdog] No pcap growth for {idle:.1f}s — re-issuing tcpdump.")
+                        self._launch_tcpdump_explicit(verify=True)
+                        processed_files.clear()
+                        single_file_tracker.clear()
+                        self._last_growth_ts = now
+
                     candidates = []
 
                     if len(file_stats) >= 2:
@@ -416,12 +476,12 @@ class LiveDataCollector:
                             tracker = single_file_tracker[sole['path']]
                             print(f"[Download] Single file {sole['path'].split('/')[-1]} tracking started (size: {sole['size']} bytes)")
 
-                        # Reduced from 3 to 2 for faster response
-                        if tracker['stable_checks'] >= 2 and tracker['size'] > 0:
+                        # 1 check: download immediately if non-empty (highest sensitivity)
+                        if tracker['stable_checks'] >= 1 and tracker['size'] > 100:
                             print(f"[Download] Single file {sole['path'].split('/')[-1]} is stable, adding to candidates")
                             candidates.append(sole)
                         else:
-                            print(f"[Download] Single file {sole['path'].split('/')[-1]} not yet stable ({tracker['stable_checks']}/2 checks)")
+                            print(f"[Download] Single file {sole['path'].split('/')[-1]} not yet stable ({tracker['stable_checks']}/1 checks, size {sole['size']}B)")
 
                     print(f"[Download] Candidates for download: {len(candidates)}")
                     now_processed = []
@@ -473,7 +533,7 @@ class LiveDataCollector:
                 except Exception as e:
                     print(f"[Download] SFTP error: {e}")
 
-                time.sleep(0.2)  # Check 5 times per second for new files
+                time.sleep(0.1)  # Check 10 times per second for new files
 
             except Exception as e:
                 print(f"[Download] Error: {e}")
