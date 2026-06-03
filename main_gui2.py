@@ -125,6 +125,8 @@ def convert_real_imag_to_mag_phase(df, mag_cols, phase_cols):
 
     for idx, row in df.iterrows():
         row_features = {}
+        if "timestamp" in df.columns:
+            row_features["timestamp"] = row["timestamp"]
 
         for sc_idx in subcarriers:
             real_col = f"SCIDX_{sc_idx}_Ratio_Real"
@@ -1119,10 +1121,10 @@ class MainApp(tk.Tk):
                 if len(self.bfm_collector.packet_buffer) > 0:
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                     fname = f"bfm_data_{label}_{ts}.csv"
-                    filepath = os.path.join(DATA_DIR, fname)
+                    filepath = os.path.join("bfm_processed_csv", fname)
                     df_out = pd.DataFrame(list(self.bfm_collector.packet_buffer))
                     df_out["label"] = label
-                    os.makedirs(DATA_DIR, exist_ok=True)
+                    os.makedirs("bfm_processed_csv", exist_ok=True)
                     df_out.to_csv(filepath, index=False)
                     self.collect_msg.config(
                         text=f"Saved {len(df_out)} BFM packets → {fname}",
