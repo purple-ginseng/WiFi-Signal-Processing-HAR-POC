@@ -95,6 +95,12 @@ WINDOW_SIZE = 5
 RETRY_INTERVAL = 2.0
 ENABLE_TRAFFIC_GENERATION = True
 
+# Magnitude clip: |cot(psi_raw=2)| = 32.585.
+# Excludes psi_raw=0 (162.97) and psi_raw=1 (54.32), which are near-singular
+# beamforming angles that produce extreme ratio magnitudes without carrying
+# useful activity information.
+MAG_CLIP = 32.585
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 def convert_real_imag_to_mag_phase(df):
@@ -136,8 +142,10 @@ def convert_real_imag_to_mag_phase(df):
                 real_val = row[real_col]
                 imag_val = row[imag_col]
 
-                # Compute magnitude and phase
-                mag = np.sqrt(real_val**2 + imag_val**2)
+                # Compute magnitude and phase.
+                # Clip magnitude: psi_raw=0/1 produce cot values of 163/54
+                # which dominate variance without carrying activity signal.
+                mag = min(np.sqrt(real_val**2 + imag_val**2), MAG_CLIP)
                 phase = np.arctan2(imag_val, real_val)
 
                 row_features[f"SCIDX_{sc_idx}_Mag"] = mag
