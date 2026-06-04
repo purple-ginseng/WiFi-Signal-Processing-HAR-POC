@@ -90,7 +90,7 @@ def _detect_tshark():
 
 
 TSHARK_PATH = _detect_tshark()
-BUFFER_SIZE = 1000
+BUFFER_SIZE = 50000
 WINDOW_SIZE = 5
 RETRY_INTERVAL = 2.0
 ENABLE_TRAFFIC_GENERATION = True
@@ -1244,6 +1244,11 @@ class MainApp(tk.Tk):
             self.collect_btn.config(state="normal")
             return
 
+        # Record the wall-clock start of this session BEFORE clearing any
+        # buffers — used below to filter out packets that belonged to a
+        # previous session but hadn't been processed yet.
+        session_start_ts = time.time()
+
         # Mark which files were already in the live dirs before this session
         snapshot_before = {
             "pcap": (
@@ -1264,6 +1269,17 @@ class MainApp(tk.Tk):
         }
 
         try:
+            # Clear all in-RAM state so this session starts with a clean slate.
+            # download_queue: drop pcap files that were queued at the tail of
+            #   the previous session but not yet processed — their packets have
+            #   timestamps before session_start_ts and would corrupt this session.
+            # packet_buffer / processed_buffer: accumulated rows from all prior
+            #   sessions; clearing them prevents the same rows from being saved
+            #   again under this session's label.
+            self.bfm_collector.download_queue.clear()
+            self.bfm_collector.packet_buffer.clear()
+            self.bfm_collector.processed_buffer.clear()
+
             # Spawn the SSH+tcpdump+SFTP+tshark+preprocess pipeline
             self.bfm_collector.start_collection()
 
@@ -1295,6 +1311,16 @@ class MainApp(tk.Tk):
                     fname = f"bfm_data_{label}_{ts}.csv"
                     filepath = os.path.join("bfm_processed_csv", fname)
                     df_out = pd.DataFrame(list(self.bfm_collector.packet_buffer))
+                    # Keep only rows captured during THIS session. The buffer
+                    # may contain packets whose pcap files were in the download
+                    # queue before the session started (timestamps < session_start_ts).
+                    if "timestamp" in df_out.columns:
+                        ts_numeric = pd.to_numeric(df_out["timestamp"], errors="coerce")
+                        before = len(df_out)
+                        df_out = df_out[ts_numeric >= session_start_ts].reset_index(drop=True)
+                        dropped = before - len(df_out)
+                        if dropped:
+                            print(f"[BFM] Filtered out {dropped} pre-session rows from buffer")
                     df_out["label"] = label
                     os.makedirs("bfm_processed_csv", exist_ok=True)
                     df_out.to_csv(filepath, index=False)
@@ -1316,13 +1342,13 @@ class MainApp(tk.Tk):
 
             # 2) Snapshot the new files into the canonical bfm_* directories
             #    (matches the main_gui.py pipeline so live sessions can feed training)
-            self._snapshot_session_to_bfm_dirs(label, snapshot_before)
+            self._snapshot_session_to_bfm_dirs(label, snapshot_before, session_start_ts)
 
             self.progress["value"] = 0
             self.timer_label.config(text="Time Remaining: 0s")
             self.collect_btn.config(state="normal")
 
-    def _snapshot_session_to_bfm_dirs(self, label, snapshot_before):
+    def _snapshot_session_to_bfm_dirs(self, label, snapshot_before, min_timestamp=None):
         """
         Merge every file produced during this session into a single output per
         directory, named `bfm_data_{label}_{timestamp}.{ext}` to match the
@@ -1331,6 +1357,8 @@ class MainApp(tk.Tk):
         - PCAPs: concatenated with scapy (rdpcap + wrpcap) so the merged file
           is still a valid libpcap container.
         - CSVs: concatenated with pandas (single header row, all rows below).
+          Rows with timestamp < min_timestamp are dropped so that tail-end data
+          from a previous session cannot bleed into this one.
         """
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         out_basename = f"bfm_data_{label}_{ts}"
@@ -1384,7 +1412,11 @@ class MainApp(tk.Tk):
                     try:
                         df = pd.read_csv(f)
                         if not df.empty:
-                            frames.append(df)
+                            if min_timestamp is not None and "timestamp" in df.columns:
+                                ts_num = pd.to_numeric(df["timestamp"], errors="coerce")
+                                df = df[ts_num >= min_timestamp].reset_index(drop=True)
+                            if not df.empty:
+                                frames.append(df)
                     except Exception as e:
                         print(f"[Snapshot] Skipping bad CSV {f}: {e}")
                 if frames:
