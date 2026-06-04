@@ -190,6 +190,10 @@ class LiveDataCollector:
         self.STALL_THRESHOLD = 5.0
         self._last_total_bytes = -1
         self._last_growth_ts = 0.0
+        # Measured offset: pc_time - router_time (seconds).
+        # Set in _connect_with_retry after querying `date +%s` on the router.
+        # Zero after a successful clock sync; non-zero if sync fails.
+        self.clock_skew_seconds = 0.0
 
         # BFM capture filter — chosen by preflight (covers VHT cat21 + HE cat30).
         # -p removed: mon0 is a monitor interface; -p (no-promiscuous) is
@@ -268,6 +272,37 @@ class LiveDataCollector:
 
                 # Establish connection
                 self.bfm_collector.connect()
+
+                # Sync router clock to PC wall time.
+                # OpenWrt/BusyBox `date -s "YYYY-MM-DD HH:MM:SS"` sets the
+                # system clock. We measure the skew first so we can correct
+                # packet timestamps in the session filter even if the sync
+                # command fails (e.g., read-only filesystem or restricted shell).
+                try:
+                    router_ts_raw, _ = self.bfm_collector.run_command(
+                        "date +%s 2>/dev/null"
+                    )
+                    router_ts = float(router_ts_raw.strip())
+                    self.clock_skew_seconds = time.time() - router_ts
+                    print(
+                        f"[Connection] Router clock skew: {self.clock_skew_seconds:+.0f}s "
+                        f"(router is {abs(self.clock_skew_seconds):.0f}s "
+                        f"{'behind' if self.clock_skew_seconds > 0 else 'ahead'} of PC)"
+                    )
+                    # Attempt to set the router clock to match the PC
+                    curr_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    _, sync_err = self.bfm_collector.run_command(
+                        f'date -s "{curr_time_str}" 2>&1'
+                    )
+                    if sync_err and "invalid" in sync_err.lower():
+                        print(f"[Connection] Clock sync failed: {sync_err.strip()}")
+                        # skew_seconds stays as measured — filter will compensate
+                    else:
+                        print(f"[Connection] Router clock synced to: {curr_time_str}")
+                        self.clock_skew_seconds = 0.0
+                except Exception as ex:
+                    print(f"[Connection] Router clock sync failed: {ex}")
+                    # Leave clock_skew_seconds at 0; filter will use PC time
 
                 # Traffic generation — same logic as pages/live_activity_detection.py
                 # which is confirmed working (BFM frames get captured when a WiFi
@@ -1230,10 +1265,18 @@ class MainApp(tk.Tk):
             self.collect_btn.config(state="normal")
             return
 
-        # Record the wall-clock start of this session BEFORE clearing any
-        # buffers — used below to filter out packets that belonged to a
-        # previous session but hadn't been processed yet.
-        session_start_ts = time.time()
+        # Compute the session-start threshold in ROUTER-LOCAL time so the
+        # filter works even when the router clock drifts or sync failed.
+        # skew = pc_time - router_time, so:
+        #   router_equivalent = pc_time - skew
+        # Subtract 5 s as a safety margin for minor sync imprecision.
+        _pc_now = time.time()
+        _skew = getattr(self.bfm_collector, "clock_skew_seconds", 0.0)
+        session_start_ts = _pc_now - _skew - 5.0
+        print(
+            f"[Session] start filter threshold: {datetime.datetime.fromtimestamp(session_start_ts):%Y-%m-%d %H:%M:%S} "
+            f"(skew={_skew:+.0f}s, margin=5s)"
+        )
 
         # Mark which files were already in the live dirs before this session
         snapshot_before = {
