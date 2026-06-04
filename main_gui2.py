@@ -97,7 +97,7 @@ ENABLE_TRAFFIC_GENERATION = True
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-def convert_real_imag_to_mag_phase(df, mag_cols, phase_cols):
+def convert_real_imag_to_mag_phase(df):
     """Convert real/imag columns to magnitude/phase"""
     import re
 
@@ -156,7 +156,7 @@ class LiveDataCollector:
     processing thread extracts/preprocesses in parallel for maximum throughput.
     """
 
-    def __init__(self, host, user, password, mag_cols, phase_cols, bfm_filter=None):
+    def __init__(self, host, user, password, bfm_filter=None):
         self.host = host
         self.user = user
         self.password = password
@@ -172,8 +172,6 @@ class LiveDataCollector:
         self.download_thread = None
         self.processing_thread = None
 
-        self.mag_cols = mag_cols
-        self.phase_cols = phase_cols
         self.connection_status = "Not connected"
         self.last_error = None
 
@@ -240,15 +238,6 @@ class LiveDataCollector:
             print(f"[tcpdump] verify failed: {e}")
             return False
         if not ps_out:
-            # Surface any filter-parse or startup error from tcpdump's stderr
-            try:
-                err_log, _ = self.bfm_collector.run_command(
-                    "cat /tmp/tcpdump_err.log 2>/dev/null"
-                )
-                if err_log:
-                    print(f"[tcpdump] stderr: {err_log}")
-            except Exception:
-                pass
             print("[tcpdump] ❌ not running after issue.")
             return False
         print(f"[tcpdump] ✅ running:\n  {ps_out}")
@@ -692,13 +681,12 @@ class LiveDataCollector:
                 # condition where two separate runs see different file sizes, and
                 # avoids the silent-failure bug where count("\n") returns 0 when
                 # tshark exits non-zero (no exception raised by subprocess.run).
-                import subprocess as _sp
                 raw_frame_count = 0
                 cat21_count = 0   # frames with VHT BFM category code (genuine candidates)
                 cat30_count = 0   # frames with HE BFM category code (WiFi 6)
 
                 try:
-                    r = _sp.run(
+                    r = subprocess.run(
                         [self.bfm_extractor.tshark_path, "-r", str(pcap_path),
                          "-T", "fields",
                          "-e", "frame.number",
@@ -791,9 +779,7 @@ class LiveDataCollector:
                 if df_processed.empty:
                     continue
 
-                df_mag_phase = convert_real_imag_to_mag_phase(
-                    df_processed, self.mag_cols, self.phase_cols
-                )
+                df_mag_phase = convert_real_imag_to_mag_phase(df_processed)
 
                 if df_mag_phase.empty:
                     continue
@@ -1652,8 +1638,6 @@ class MainApp(tk.Tk):
                 host="192.168.1.1",
                 user="root",
                 password="123456",
-                mag_cols=[],
-                phase_cols=[],
                 bfm_filter=chosen_filter,
             )
             # Give the collector a reference to the UI's ping target so the
@@ -1755,7 +1739,7 @@ class MainApp(tk.Tk):
 
         Returns (all_required_passed, list_of_human_readable_lines).
         """
-        import paramiko, subprocess as _sp
+        import paramiko
 
         lines = []
         ok = True
@@ -1766,7 +1750,7 @@ class MainApp(tk.Tk):
                 ping_cmd = ["ping", "-w", "1", "-w", "2000", host]
             else:
                 ping_cmd = ["ping", "-c", "1", "-W", "2000", host]
-            r = _sp.run(ping_cmd, capture_output=True, timeout=4)
+            r = subprocess.run(ping_cmd, capture_output=True, timeout=4)
             if r.returncode == 0:
                 lines.append(f"✓ Router {host} reachable")
             else:
