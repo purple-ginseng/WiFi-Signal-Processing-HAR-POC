@@ -194,9 +194,9 @@ class LiveDataCollector:
         # semantically wrong here and can silently suppress frames on some drivers.
         self._tcpdump_cmd = (
             "killall tcpdump 2>/dev/null; "
-            "rm -f /tmp/bfm_capture*; "
+            "rm -f /tmp/bfm_capture* /tmp/tcpdump_err.log; "
             "tcpdump -i mon0 -U -B 4096 -G 1 -W 10 -w /tmp/bfm_capture "
-            "'wlan[24] == 21' > /dev/null 2>&1 &"  # wlan[24] == 21, (wlan[0] & 0xfc) == 0xd0
+            "'wlan[24] == 21' > /dev/null 2>/tmp/tcpdump_err.log &"  # wlan[24] == 21
         )
 
         # Create directories for BFM pipeline
@@ -235,6 +235,15 @@ class LiveDataCollector:
             print(f"[tcpdump] verify failed: {e}")
             return False
         if not ps_out:
+            # Surface any filter-parse or startup error from tcpdump's stderr
+            try:
+                err_log, _ = self.bfm_collector.run_command(
+                    "cat /tmp/tcpdump_err.log 2>/dev/null"
+                )
+                if err_log:
+                    print(f"[tcpdump] stderr: {err_log}")
+            except Exception:
+                pass
             print("[tcpdump] ❌ not running after issue.")
             return False
         print(f"[tcpdump] ✅ running:\n  {ps_out}")
@@ -788,6 +797,7 @@ class MainApp(tk.Tk):
         # BFM Settings
         self.bfm_is_setup = False
         self.bfm_collector = None
+        self._bfm_filter_override = None  # set by preflight if BFM filter yields nothing
 
     def _on_close(self):
         self._stop_csi.set()
@@ -1496,6 +1506,14 @@ class MainApp(tk.Tk):
             # Give the collector a reference to the UI's ping target so the
             # initial connection ping uses the same IP as _restart_router_ping.
             self.bfm_collector._app_ping_target_ip = self.ping_target_ip
+            # Apply filter override detected during preflight (e.g. broad
+            # action-frame filter when tcpdump-mini rejects wlan[24]==21).
+            if self._bfm_filter_override:
+                old_cmd = self.bfm_collector._tcpdump_cmd
+                self.bfm_collector._tcpdump_cmd = old_cmd.replace(
+                    "'wlan[24] == 21'", f"'{self._bfm_filter_override}'"
+                )
+                print(f"[Preflight] Filter override applied: {self._bfm_filter_override}")
             self.after(0, lambda: self._on_preflight_succeeded(report))
         except Exception as e:
             err = f"Collector init failed: {e}"
@@ -1661,6 +1679,110 @@ class MainApp(tk.Tk):
             else:
                 lines.append("✗ Failed to create mon0 monitor interface")
                 ok = False
+
+        # 5b. Lock mon0 to the AP's current operating channel so the monitor
+        #     interface actually hears the traffic it is supposed to capture.
+        #     iw dev <wlan> info reports the channel the AP is operating on.
+        ap_channel = None
+        for iface in ("wlan0", "wlan1", "wlan0-1"):
+            ch_out, _ = _ssh(f"iw dev {iface} info 2>/dev/null")
+            for ln in ch_out.splitlines():
+                ln = ln.strip()
+                if ln.startswith("channel "):
+                    # e.g. "channel 36 (5180 MHz), width: 80 MHz"
+                    try:
+                        ap_channel = int(ln.split()[1])
+                    except (IndexError, ValueError):
+                        pass
+                    break
+            if ap_channel:
+                break
+
+        if ap_channel:
+            _, ch_err = _ssh(f"iw dev mon0 set channel {ap_channel} 2>&1")
+            if ch_err:
+                lines.append(f"⚠ mon0 channel set to {ap_channel} (warning: {ch_err})")
+            else:
+                lines.append(f"✓ mon0 locked to AP channel {ap_channel}")
+        else:
+            lines.append("⚠ Could not detect AP channel — mon0 may be on wrong channel")
+
+        # 5c. Verify the BFM filter works on this tcpdump build by running a
+        #     2-second test capture.  If it produces only the 24-byte header
+        #     (zero packets) try the broader action-frame filter so we know
+        #     whether it is a filter-syntax issue or simply no BFM frames.
+        if ok:
+            # Kill any existing test capture first
+            _ssh("killall tcpdump 2>/dev/null; rm -f /tmp/_preflight.pcap")
+            time.sleep(0.3)
+            _ssh(
+                "tcpdump -i mon0 -U -c 50 -w /tmp/_preflight.pcap "
+                "'wlan[24] == 21' > /tmp/_preflight.log 2>&1 &"
+            )
+            time.sleep(2)
+            _ssh("killall tcpdump 2>/dev/null")
+            time.sleep(0.3)
+
+            sz_out, _ = _ssh("wc -c < /tmp/_preflight.pcap 2>/dev/null")
+            try:
+                pcap_bytes = int(sz_out.strip())
+            except (ValueError, AttributeError):
+                pcap_bytes = 0
+
+            filter_log, _ = _ssh("cat /tmp/_preflight.log 2>/dev/null")
+            _ssh("rm -f /tmp/_preflight.pcap /tmp/_preflight.log")
+
+            if pcap_bytes > 24:
+                bfm_pkts = (pcap_bytes - 24) // 20  # rough lower bound
+                lines.append(
+                    f"✓ BFM filter test: captured data ({pcap_bytes} bytes, "
+                    f"~{bfm_pkts}+ packets) — filter 'wlan[24]==21' works"
+                )
+            else:
+                # Zero packets with BFM filter — try broader action-frame filter
+                lines.append(
+                    f"⚠ BFM filter 'wlan[24]==21' captured 0 packets in 2 s "
+                    f"(file={pcap_bytes} B)"
+                )
+                if filter_log:
+                    lines.append(f"  tcpdump stderr: {filter_log[:200]}")
+
+                # Broad action-frame filter test
+                _ssh("killall tcpdump 2>/dev/null; rm -f /tmp/_preflight2.pcap")
+                time.sleep(0.3)
+                _ssh(
+                    "tcpdump -i mon0 -U -c 50 -w /tmp/_preflight2.pcap "
+                    "'(wlan[0] & 0xfc) == 0xd0' > /tmp/_preflight2.log 2>&1 &"
+                )
+                time.sleep(2)
+                _ssh("killall tcpdump 2>/dev/null")
+                time.sleep(0.3)
+
+                sz2_out, _ = _ssh("wc -c < /tmp/_preflight2.pcap 2>/dev/null")
+                log2, _ = _ssh("cat /tmp/_preflight2.log 2>/dev/null")
+                _ssh("rm -f /tmp/_preflight2.pcap /tmp/_preflight2.log")
+                try:
+                    pcap2_bytes = int(sz2_out.strip())
+                except (ValueError, AttributeError):
+                    pcap2_bytes = 0
+
+                if pcap2_bytes > 24:
+                    lines.append(
+                        f"✓ Broad action-frame filter captured data ({pcap2_bytes} B) "
+                        f"— switching to '(wlan[0] & 0xfc) == 0xd0'"
+                    )
+                    # Store the override so LiveDataCollector picks it up
+                    self._bfm_filter_override = "(wlan[0] & 0xfc) == 0xd0"
+                else:
+                    lines.append(
+                        f"✗ Broad filter also captured 0 packets ({pcap2_bytes} B). "
+                        f"mon0 may be on wrong channel, or no WiFi traffic present."
+                    )
+                    if log2:
+                        lines.append(f"  tcpdump stderr: {log2[:200]}")
+                    # Not a hard failure — let streaming proceed; user can investigate
+                    if ap_channel is None:
+                        ok = False  # No channel AND no packets = certainly wrong setup
 
         # 6. Local working directories
         for d in (
