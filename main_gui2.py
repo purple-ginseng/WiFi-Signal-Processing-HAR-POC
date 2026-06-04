@@ -686,42 +686,50 @@ class LiveDataCollector:
                 print(f"[Processing] {pcap_path.name}...")
                 self.total_processed += 1
 
-                # ── Step 0: Count raw frames and check for HE BFM (cat 30) ──
-                # We run two quick tshark counts — no verbose output, just line
-                # counts — to get the yield denominator and warn about WiFi 6.
+                # ── Step 0: Single tshark pass — count all frames and category codes ──
+                # One combined -T fields call reads frame.number AND
+                # wlan.fixed.category_code in one shot.  This avoids the race
+                # condition where two separate runs see different file sizes, and
+                # avoids the silent-failure bug where count("\n") returns 0 when
+                # tshark exits non-zero (no exception raised by subprocess.run).
                 import subprocess as _sp
                 raw_frame_count = 0
-                cat30_count = 0
+                cat21_count = 0   # frames with VHT BFM category code (genuine candidates)
+                cat30_count = 0   # frames with HE BFM category code (WiFi 6)
+
                 try:
                     r = _sp.run(
                         [self.bfm_extractor.tshark_path, "-r", str(pcap_path),
-                         "-T", "fields", "-e", "frame.number"],
+                         "-T", "fields",
+                         "-e", "frame.number",
+                         "-e", "wlan.fixed.category_code"],
                         capture_output=True, text=True, encoding="utf-8",
                     )
-                    raw_frame_count = r.stdout.count("\n")
-                    self.total_raw_frames += raw_frame_count
-                except Exception:
-                    pass
+                    for line in r.stdout.splitlines():
+                        parts = line.split("\t")
+                        # frame.number is always present for a readable frame
+                        if not parts[0].strip():
+                            continue
+                        raw_frame_count += 1
+                        cat = parts[1].strip() if len(parts) > 1 else ""
+                        if cat == "21":
+                            cat21_count += 1
+                        elif cat == "30":
+                            cat30_count += 1
 
-                if raw_frame_count > 0:
-                    try:
-                        r30 = _sp.run(
-                            [self.bfm_extractor.tshark_path, "-r", str(pcap_path),
-                             "-Y", "wlan.fixed.category_code == 30",
-                             "-T", "fields", "-e", "frame.number"],
-                            capture_output=True, text=True, encoding="utf-8",
+                    self.total_raw_frames += raw_frame_count
+
+                    if cat30_count > 0:
+                        self.total_cat30_frames += cat30_count
+                        print(
+                            f"[Processing] ⚠ {cat30_count}/{raw_frame_count} frames are "
+                            f"HE BFM (cat 30 / WiFi 6) in {pcap_path.name} — "
+                            "extractor only handles cat 21 (VHT). "
+                            "If your router is 802.11ax-only these are your real BFM frames "
+                            "but extraction is not yet supported."
                         )
-                        cat30_count = r30.stdout.count("\n")
-                        if cat30_count > 0:
-                            self.total_cat30_frames += cat30_count
-                            print(
-                                f"[Processing] ⚠ {cat30_count} HE BFM (cat 30 / WiFi 6) frames "
-                                f"in {pcap_path.name} — extractor only handles cat 21 (VHT). "
-                                "If your router is 802.11ax-only, these are your BFM frames "
-                                "but extraction is not yet supported."
-                            )
-                    except Exception:
-                        pass
+                except Exception as _e:
+                    print(f"[Processing] Frame-count scan failed: {_e}")
 
                 # ── Step 1: Extract BFM data (phi/psi angles via tshark cat21) ──
                 csv_raw_path = Path("live_bfm_raw_csv") / (pcap_path.stem + ".csv")
@@ -732,32 +740,35 @@ class LiveDataCollector:
                     # Most failures are "No packets" - skip silently
                     if "No packets" not in str(e):
                         print(f"[Processing] Extraction error: {e}")
-                    if raw_frame_count > 0 and cat30_count == 0:
-                        # Frames were captured but none matched cat 21 or 30 —
-                        # likely noise from wrong channel or wrong WiFi standard.
+                    if raw_frame_count > 0 and cat21_count == 0 and cat30_count == 0:
                         print(
                             f"[Processing] ⚠ {raw_frame_count} raw frames captured but "
-                            "0 passed the cat-21 BFM extractor and 0 were cat-30 HE. "
-                            "These are likely non-BFM frames (noise / wrong channel)."
+                            "none were cat-21 or cat-30. Likely non-BFM noise "
+                            "(wrong channel or incorrect tcpdump filter)."
                         )
                     continue
 
                 if not csv_raw_path.exists():
                     continue
 
-                # Yield = BFM rows extracted ÷ raw frames captured
+                # extracted_rows = rows in the raw CSV (one per successfully parsed BFM frame)
                 extracted_rows = 0
                 try:
-                    extracted_rows = sum(1 for _ in open(csv_raw_path)) - 1  # subtract header
+                    with open(csv_raw_path) as _f:
+                        extracted_rows = max(0, sum(1 for _ in _f) - 1)  # subtract header
                 except Exception:
                     pass
 
+                # Yield = cat-21 frames parsed by tshark's protocol dissector ÷
+                #         total frames in pcap (which tcpdump pre-filtered to BFM candidates).
+                # Should stay ≤ 100% because extracted ≤ cat21 ≤ raw.
                 if raw_frame_count > 0:
                     yield_pct = 100.0 * extracted_rows / raw_frame_count
                     status = "✓" if yield_pct > 0 else "⚠"
                     print(
-                        f"[Processing] {status} BFM yield: {extracted_rows}/{raw_frame_count} frames "
-                        f"({yield_pct:.1f}%) are genuine VHT BFM (φ11/ψ21 parsed by tshark cat-21)"
+                        f"[Processing] {status} BFM yield: {extracted_rows}/{raw_frame_count} "
+                        f"({yield_pct:.1f}%) — "
+                        f"cat21={cat21_count}, cat30={cat30_count}, other={raw_frame_count - cat21_count - cat30_count}"
                     )
 
                 # ── Step 2: Preprocess to complex ratios ──
@@ -796,10 +807,13 @@ class LiveDataCollector:
                 for idx, row in df_processed.iterrows():
                     self.processed_buffer.append(row.to_dict())
 
-                self.total_packets += num_packets
+                # Count extracted BFM rows (not df_mag_phase rows, which equals
+                # extracted_rows but is computed from a different code path).
+                self.total_packets += extracted_rows
                 print(
-                    f"[Processing] ✓ +{num_packets} BFM packets → buffer: {len(self.packet_buffer)}, "
-                    f"total BFM: {self.total_packets}, raw captured: {self.total_raw_frames}"
+                    f"[Processing] ✓ +{extracted_rows} BFM packets → buffer: {len(self.packet_buffer)}, "
+                    f"total BFM: {self.total_packets}/{self.total_raw_frames} raw "
+                    f"({100.0 * self.total_packets / max(self.total_raw_frames, 1):.1f}% yield)"
                 )
 
             except Exception as e:
