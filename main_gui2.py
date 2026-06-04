@@ -288,36 +288,69 @@ class LiveDataCollector:
                         f"(router is {abs(self.clock_skew_seconds):.0f}s "
                         f"{'behind' if self.clock_skew_seconds > 0 else 'ahead'} of PC)"
                     )
-                    # Stop NTP daemon so it cannot revert our clock change.
-                    # Try both the init script and a direct kill; errors are
-                    # suppressed so this never blocks the connection attempt.
+                    # Show what NTP is running so we can diagnose failures.
+                    ntp_ps, _ = self.bfm_collector.run_command(
+                        "ps | grep -i ntp | grep -v grep 2>/dev/null"
+                    )
+                    print(f"[Connection] NTP processes before stop: {ntp_ps.strip() or 'none found'}")
+
+                    # Stop NTP aggressively — procd (OpenWrt's process supervisor)
+                    # will restart a service stopped via init.d, so we also remove
+                    # it from procd's watchlist via ubus and kill the process directly.
                     self.bfm_collector.run_command(
+                        # Remove from procd so it won't be restarted automatically
+                        "ubus call service delete '{\"name\":\"sysntpd\"}' 2>/dev/null; "
+                        # Disable + stop via init scripts (covers renamed services)
+                        "/etc/init.d/sysntpd disable 2>/dev/null; "
                         "/etc/init.d/sysntpd stop 2>/dev/null; "
-                        "killall ntpd 2>/dev/null; "
+                        "/etc/init.d/ntpd stop 2>/dev/null; "
+                        # SIGKILL any remaining ntpd process (busybox ntpd shows as 'ntpd')
+                        "killall -9 ntpd 2>/dev/null; "
+                        "killall -9 sysntpd 2>/dev/null; "
                         "true"
                     )
-                    curr_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    _, sync_err = self.bfm_collector.run_command(
-                        f'date -s "{curr_time_str}" 2>&1'
+                    time.sleep(0.5)  # let procd settle before verifying
+
+                    # Verify NTP is actually gone
+                    ntp_ps_after, _ = self.bfm_collector.run_command(
+                        "ps | grep -i ntp | grep -v grep 2>/dev/null"
                     )
-                    if sync_err and "invalid" in sync_err.lower():
-                        print(f"[Connection] Clock sync failed: {sync_err.strip()}")
+                    if ntp_ps_after.strip():
+                        print(f"[Connection] ⚠️ NTP still running after stop: {ntp_ps_after.strip()}")
                     else:
-                        # Verify the clock actually took — NTP sometimes reverts
-                        # within the same second if the stop command arrived late.
+                        print("[Connection] NTP stopped OK")
+
+                    # Set the time and retry once if it didn't stick.
+                    for _attempt in range(2):
+                        curr_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        _, sync_err = self.bfm_collector.run_command(
+                            f'date -s "{curr_time_str}" 2>&1'
+                        )
+                        if sync_err and "invalid" in sync_err.lower():
+                            print(f"[Connection] Clock sync failed: {sync_err.strip()}")
+                            break
                         router_ts_after, _ = self.bfm_collector.run_command(
                             "date +%s 2>/dev/null"
                         )
                         router_ts_after = float(router_ts_after.strip())
                         residual_skew = abs(time.time() - router_ts_after)
-                        if residual_skew > 60:
-                            print(
-                                f"[Connection] ⚠️ Clock sync incomplete — "
-                                f"residual skew {residual_skew:.0f}s. NTP may still be running."
-                            )
-                        else:
+                        if residual_skew <= 60:
                             print(f"[Connection] Router clock synced to: {curr_time_str} (skew now {residual_skew:.0f}s)")
                             self.clock_skew_seconds = 0.0
+                            break
+                        if _attempt == 0:
+                            # NTP reverted already — kill again and retry
+                            print(f"[Connection] Clock reverted (skew {residual_skew:.0f}s), killing NTP again…")
+                            self.bfm_collector.run_command(
+                                "killall -9 ntpd 2>/dev/null; killall -9 sysntpd 2>/dev/null; true"
+                            )
+                            time.sleep(0.3)
+                        else:
+                            print(
+                                f"[Connection] ⚠️ Clock sync incomplete — "
+                                f"residual skew {residual_skew:.0f}s. "
+                                "PC timestamps will be used for session tagging."
+                            )
                 except Exception as ex:
                     print(f"[Connection] Router clock sync failed: {ex}")
 
@@ -836,10 +869,16 @@ class LiveDataCollector:
                 if df_mag_phase.empty:
                     continue
 
-                # Add packets to buffers
+                # Add packets to buffers.
+                # Stamp each row with the PC wall-clock time at processing so
+                # sessions are always distinguishable even if the router's clock
+                # is wrong (stuck in 2025) or NTP reverts the sync.
                 num_packets = len(df_mag_phase)
+                pc_now = time.time()
                 for idx, row in df_mag_phase.iterrows():
-                    self.packet_buffer.append(row.to_dict())
+                    row_dict = row.to_dict()
+                    row_dict["pc_timestamp"] = pc_now
+                    self.packet_buffer.append(row_dict)
 
                 # Also keep processed data for Doppler analysis
                 for idx, row in df_processed.iterrows():
