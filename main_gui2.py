@@ -794,16 +794,15 @@ class MainApp(tk.Tk):
         self.source_mode = tk.StringVar(value="BFM-PCAP")
         self._stop_csi = threading.Event()
 
-        self._build_ui()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        # BFM Settings
+        # BFM Settings — must be initialized before _build_ui() so the
+        # collection tab can bind to these vars during widget construction.
         self.bfm_is_setup = False
         self.bfm_collector = None
-        # Filter chosen by progressive preflight test (VHT cat21, HE cat30, etc.)
         self._bfm_tcpdump_filter = None
-        # mon0 channel override var — populated by _build_collection_ui
         self.mon0_channel_var = tk.StringVar(value="")
+
+        self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_close(self):
         self._stop_csi.set()
