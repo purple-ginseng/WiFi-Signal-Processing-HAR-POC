@@ -185,13 +185,17 @@ class LiveDataCollector:
         # Stall-detection watchdog: if total bytes across /tmp/bfm_capture*
         # don't change for STALL_THRESHOLD seconds, the explicit tcpdump
         # command is re-issued on the router.
-        self.STALL_THRESHOLD = 0.5
+        # Must be well above the tcpdump rotation period (-G 1 = 1 s) to
+        # avoid spurious restarts during normal quiet moments.
+        self.STALL_THRESHOLD = 5.0
         self._last_total_bytes = -1
         self._last_growth_ts = 0.0
+        # -p removed: mon0 is a monitor interface; -p (no-promiscuous) is
+        # semantically wrong here and can silently suppress frames on some drivers.
         self._tcpdump_cmd = (
             "killall tcpdump 2>/dev/null; "
             "rm -f /tmp/bfm_capture*; "
-            "tcpdump -i mon0 -p -U -B 4096 -G 1 -W 10 -w /tmp/bfm_capture "
+            "tcpdump -i mon0 -U -B 4096 -G 1 -W 10 -w /tmp/bfm_capture "
             "'wlan[24] == 21' > /dev/null 2>&1 &"  # wlan[24] == 21, (wlan[0] & 0xfc) == 0xd0
         )
 
@@ -273,10 +277,19 @@ class LiveDataCollector:
                     # immediately overrides this with the UI's current value
                     # right after start_collection() returns.
                     print("[Connection] Starting initial ping at 1 ms (1 kHz)...")
+                    # Use the UI's ping target IP if available; fall back to .2
+                    # so the ping goes over the WiFi radio and triggers BFM sounding.
+                    _ping_target = "192.168.1.2"
+                    try:
+                        _t = getattr(self, "_app_ping_target_ip", None)
+                        if _t:
+                            _ping_target = _t.get().strip() or _ping_target
+                    except Exception:
+                        pass
                     self.bfm_collector.run_command(
-                        "ping -i 0.001 192.168.1.1 > /dev/null 2>&1 &"
+                        f"ping -i 0.001 {_ping_target} > /dev/null 2>&1 &"
                     )
-                    print("[Connection] ✅ Traffic generation enabled ")
+                    print(f"[Connection] ✅ Traffic generation enabled (ping → {_ping_target})")
                 else:
                     print("[Connection] ⚠️ Traffic generation DISABLED ")
                     print(
@@ -377,10 +390,28 @@ class LiveDataCollector:
 
         print("[Download] Starting download loop...")
 
-        # Track processed files to avoid re-downloading
+        # Track processed files to avoid re-downloading.
+        # Capped at 500 entries — the tcpdump ring buffer reuses only 10 remote
+        # paths, so growth is only from incremented mtimes across sessions.
+        PROCESSED_FILES_MAX = 500
         processed_files = {}
         single_file_tracker = {}
         loop_count = 0  # Counter for periodic checks
+
+        # Persistent SFTP session — opened once, reused across all poll iterations
+        # to avoid the cost (and channel-exhaustion risk) of open()/close() at 10 Hz.
+        sftp = None
+
+        def _open_sftp():
+            nonlocal sftp
+            if sftp is not None:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+            sftp = self.bfm_collector.client.open_sftp()
+
+        _open_sftp()
 
         while self.running:
             try:
@@ -400,9 +431,10 @@ class LiveDataCollector:
                             print(
                                 "[Download] ⚠️ tcpdump NOT running! Attempting to restart..."
                             )
-                            self.bfm_collector.run_tcpdump()
-                            # self.bfm_collector.run_command("iw dev mon0 set channel 149")
-                            # self.bfm_collector.run_command("tcpdump -i mon0 -U -p -w /tmp/bfm_capture -W 10 -C 1 'wlan[24] == 21' > /dev/null 2>&1 &")
+                            # Use the same explicit command as initial startup so
+                            # flags stay consistent; don't call run_tcpdump() which
+                            # uses BFMCollector's default (different) parameters.
+                            self._launch_tcpdump_explicit(verify=False)
                     except Exception as e:
                         print(f"[Download] tcpdump health check failed: {e}")
 
@@ -410,14 +442,24 @@ class LiveDataCollector:
                 if not self.bfm_collector or not self.bfm_collector.client:
                     print("[Download] Connection lost, attempting to reconnect...")
                     self.connected = False
+                    if sftp is not None:
+                        try:
+                            sftp.close()
+                        except Exception:
+                            pass
+                        sftp = None
                     self._connect_with_retry()
                     if not self.connected:
                         time.sleep(RETRY_INTERVAL)
                         continue
+                    _open_sftp()
 
-                # Manually check for pcap files on router via SFTP
+                # Poll the router for new pcap files using the persistent SFTP session.
                 try:
-                    sftp = self.bfm_collector.client.open_sftp()
+                    # Re-open only if the session was lost (e.g. after reconnect)
+                    if sftp is None:
+                        _open_sftp()
+
                     remote_files = sftp.listdir("/tmp/")
                     pcap_files = [
                         f for f in remote_files if f.startswith("bfm_capture")
@@ -425,9 +467,7 @@ class LiveDataCollector:
 
                     if not pcap_files:
                         # Debug: Show what files ARE in /tmp/
-                        tmp_files_sample = [
-                            f for f in remote_files[:20]
-                        ]  # First 20 files
+                        tmp_files_sample = [f for f in remote_files[:20]]
                         print(
                             f"[Download] No pcap files found on router (checked for 'bfm_capture*')"
                         )
@@ -435,7 +475,6 @@ class LiveDataCollector:
                         processed_files.clear()
                         single_file_tracker.clear()
                         time.sleep(0.1)
-                        sftp.close()
                         continue
 
                     print(f"[Download] Found {len(pcap_files)} file(s): {pcap_files}")
@@ -460,7 +499,6 @@ class LiveDataCollector:
                     if not file_stats:
                         print("[Download] No valid file stats collected")
                         time.sleep(0.1)
-                        sftp.close()
                         continue
 
                     file_stats.sort(key=lambda x: x["mtime"])
@@ -536,7 +574,6 @@ class LiveDataCollector:
                             )
 
                     print(f"[Download] Candidates for download: {len(candidates)}")
-                    now_processed = []
 
                     for entry in candidates:
                         remote_path = entry["path"]
@@ -565,7 +602,10 @@ class LiveDataCollector:
                         try:
                             sftp.get(remote_path, str(local_path))
                             processed_files[remote_path] = entry["mtime"]
-                            now_processed.append(remote_path)
+                            # Prune oldest entries to cap memory use
+                            if len(processed_files) > PROCESSED_FILES_MAX:
+                                oldest = next(iter(processed_files))
+                                del processed_files[oldest]
                             self.total_downloaded += 1
 
                             # DO NOT remove the remote file - let tcpdump manage rotation!
@@ -582,14 +622,21 @@ class LiveDataCollector:
                             )
                         except Exception as e:
                             print(f"[Download] Failed to download {remote_path}: {e}")
-
-                    # Keep processed files in memory to avoid re-downloading
-                    # tcpdump will rotate to new files automatically via -W flag
-
-                    sftp.close()
+                            # Invalidate the SFTP session so it is re-opened next iteration
+                            try:
+                                sftp.close()
+                            except Exception:
+                                pass
+                            sftp = None
 
                 except Exception as e:
                     print(f"[Download] SFTP error: {e}")
+                    # Session may be broken — close and let next iteration reopen
+                    try:
+                        sftp.close()
+                    except Exception:
+                        pass
+                    sftp = None
 
                 time.sleep(0.1)  # Check 10 times per second for new files
 
@@ -884,14 +931,20 @@ class MainApp(tk.Tk):
             ms = 1.0
         ms = max(0.1, min(ms, 60_000.0))  # sanity clamp
         seconds = ms / 1000.0
+        target = getattr(self, "ping_target_ip", None)
+        target_ip = target.get().strip() if target else "192.168.1.2"
+        if not target_ip:
+            target_ip = "192.168.1.2"
         # busybox ping accepts -i in seconds (decimal). 0.001 → 1 ms = 1 kHz.
+        # Target must be a connected WiFi client IP so the ping travels over
+        # the radio and triggers BFM NDP sounding frames from the AP.
         cmd = (
             "killall ping 2>/dev/null; "
-            f"ping -i {seconds:g} 192.168.1.1 > /dev/null 2>&1 &"
+            f"ping -i {seconds:g} {target_ip} > /dev/null 2>&1 &"
         )
         try:
             self.bfm_collector.run_command(cmd)
-            print(f"[Ping] Restarted at {ms:g} ms ({1000/ms:.0f} Hz)")
+            print(f"[Ping] Restarted → {target_ip} at {ms:g} ms ({1000/ms:.0f} Hz)")
         except Exception as e:
             print(f"[Ping] Failed to restart: {e}")
 
@@ -923,9 +976,24 @@ class MainApp(tk.Tk):
         self.duration_entry.insert(0, "120")
         self.duration_entry.pack(fill="x", padx=10)
 
+        # Ping target IP — must be a WiFi client's IP, NOT the router's own IP.
+        # Pinging the router itself (192.168.1.1) is handled by the kernel
+        # loopback and never goes over the radio, so it cannot trigger BFM
+        # sounding frames from clients.
+        ping_target_row = ttk.Frame(parent)
+        ping_target_row.pack(fill="x", pady=(10, 0), padx=10)
+        ttk.Label(ping_target_row, text="Ping target IP (WiFi client):").pack(side="left")
+        self.ping_target_ip = tk.StringVar(value="192.168.1.2")
+        ttk.Entry(ping_target_row, textvariable=self.ping_target_ip, width=16).pack(
+            side="left", padx=6
+        )
+        ttk.Label(ping_target_row, text="(must be a connected WiFi client, not the router)").pack(
+            side="left", padx=4
+        )
+
         # Ping interval (ms) — refreshed at every Start Collection
         ping_row = ttk.Frame(parent)
-        ping_row.pack(fill="x", pady=(10, 0), padx=10)
+        ping_row.pack(fill="x", pady=(6, 0), padx=10)
         ttk.Label(ping_row, text="Ping interval (ms):").pack(side="left")
         self.ping_interval_ms = tk.DoubleVar(value=1.0)
         ttk.Spinbox(
@@ -1425,6 +1493,9 @@ class MainApp(tk.Tk):
                 mag_cols=[],
                 phase_cols=[],
             )
+            # Give the collector a reference to the UI's ping target so the
+            # initial connection ping uses the same IP as _restart_router_ping.
+            self.bfm_collector._app_ping_target_ip = self.ping_target_ip
             self.after(0, lambda: self._on_preflight_succeeded(report))
         except Exception as e:
             err = f"Collector init failed: {e}"
