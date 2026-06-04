@@ -156,7 +156,7 @@ class LiveDataCollector:
     processing thread extracts/preprocesses in parallel for maximum throughput.
     """
 
-    def __init__(self, host, user, password, mag_cols, phase_cols):
+    def __init__(self, host, user, password, mag_cols, phase_cols, bfm_filter=None):
         self.host = host
         self.user = user
         self.password = password
@@ -190,13 +190,16 @@ class LiveDataCollector:
         self.STALL_THRESHOLD = 5.0
         self._last_total_bytes = -1
         self._last_growth_ts = 0.0
+
+        # BFM capture filter — chosen by preflight (covers VHT cat21 + HE cat30).
         # -p removed: mon0 is a monitor interface; -p (no-promiscuous) is
         # semantically wrong here and can silently suppress frames on some drivers.
+        _filter = bfm_filter if bfm_filter is not None else "wlan[24] == 21 or wlan[24] == 30"
         self._tcpdump_cmd = (
             "killall tcpdump 2>/dev/null; "
-            "rm -f /tmp/bfm_capture* /tmp/tcpdump_err.log; "
-            "tcpdump -i mon0 -U -B 4096 -G 1 -W 10 -w /tmp/bfm_capture "
-            "'wlan[24] == 21' > /dev/null 2>/tmp/tcpdump_err.log &"  # wlan[24] == 21
+            "rm -f /tmp/bfm_capture*; "
+            f"tcpdump -i mon0 -U -B 4096 -G 1 -W 10 -w /tmp/bfm_capture "
+            f"'{_filter}' > /dev/null 2>&1 &"
         )
 
         # Create directories for BFM pipeline
@@ -797,7 +800,10 @@ class MainApp(tk.Tk):
         # BFM Settings
         self.bfm_is_setup = False
         self.bfm_collector = None
-        self._bfm_filter_override = None  # set by preflight if BFM filter yields nothing
+        # Filter chosen by progressive preflight test (VHT cat21, HE cat30, etc.)
+        self._bfm_tcpdump_filter = None
+        # mon0 channel override var — populated by _build_collection_ui
+        self.mon0_channel_var = tk.StringVar(value="")
 
     def _on_close(self):
         self._stop_csi.set()
@@ -972,10 +978,19 @@ class MainApp(tk.Tk):
         )
         src_menu.pack(side="left", padx=5)
 
+        setup_row = ttk.Frame(parent)
+        setup_row.pack(fill="x", pady=5, padx=10)
         self.bfm_setup_btn = ttk.Button(
-            parent, text="Setup BFM", command=self._toggle_bfm_setup
+            setup_row, text="Setup BFM", command=self._toggle_bfm_setup
         )
-        self.bfm_setup_btn.pack(pady=5)
+        self.bfm_setup_btn.pack(side="left")
+        ttk.Label(setup_row, text="  mon0 channel (override, blank=auto):").pack(side="left")
+        ttk.Entry(setup_row, textvariable=self.mon0_channel_var, width=6).pack(
+            side="left", padx=4
+        )
+        ttk.Label(setup_row, text="e.g. 36 or 149 — leave blank to auto-detect").pack(
+            side="left", padx=4
+        )
 
         ttk.Label(parent, text="Label for this session:").pack(anchor="w", pady=(10, 0))
         self.collect_label = ttk.Entry(parent)
@@ -1496,24 +1511,20 @@ class MainApp(tk.Tk):
             return
 
         try:
+            # Use the filter chosen by the progressive preflight test.
+            # Falls back to the combined VHT+HE default if preflight didn't run.
+            chosen_filter = getattr(self, "_bfm_tcpdump_filter", None)
             self.bfm_collector = LiveDataCollector(
                 host="192.168.1.1",
                 user="root",
                 password="123456",
                 mag_cols=[],
                 phase_cols=[],
+                bfm_filter=chosen_filter,
             )
             # Give the collector a reference to the UI's ping target so the
             # initial connection ping uses the same IP as _restart_router_ping.
             self.bfm_collector._app_ping_target_ip = self.ping_target_ip
-            # Apply filter override detected during preflight (e.g. broad
-            # action-frame filter when tcpdump-mini rejects wlan[24]==21).
-            if self._bfm_filter_override:
-                old_cmd = self.bfm_collector._tcpdump_cmd
-                self.bfm_collector._tcpdump_cmd = old_cmd.replace(
-                    "'wlan[24] == 21'", f"'{self._bfm_filter_override}'"
-                )
-                print(f"[Preflight] Filter override applied: {self._bfm_filter_override}")
             self.after(0, lambda: self._on_preflight_succeeded(report))
         except Exception as e:
             err = f"Collector init failed: {e}"
@@ -1680,109 +1691,166 @@ class MainApp(tk.Tk):
                 lines.append("✗ Failed to create mon0 monitor interface")
                 ok = False
 
-        # 5b. Lock mon0 to the AP's current operating channel so the monitor
-        #     interface actually hears the traffic it is supposed to capture.
-        #     iw dev <wlan> info reports the channel the AP is operating on.
+        # 5b. Lock mon0 to the AP's current operating channel.
+        #
+        # Strategy:
+        #   1. Let the UI override take priority (mon0_channel entry, if set).
+        #   2. Fall back to auto-detection from `iw dev` across all known
+        #      OpenWrt interface naming conventions (wlan*, ath*, ap*).
+        #   3. Parse both channel number AND channel-width so we can call
+        #      `iw dev mon0 set freq <MHz> <HT>` which works on 5 GHz where
+        #      `set channel` sometimes silently ignores the width.
+        #
+        # Without this, mon0 idles on whatever the driver last used and
+        # captures nothing because the AP is on a completely different channel.
+
+        # --- UI override ---
+        manual_ch = ""
+        try:
+            manual_ch = self.mon0_channel_var.get().strip()
+        except Exception:
+            pass
+
+        # --- Auto-detect from router ---
         ap_channel = None
-        for iface in ("wlan0", "wlan1", "wlan0-1"):
-            ch_out, _ = _ssh(f"iw dev {iface} info 2>/dev/null")
-            for ln in ch_out.splitlines():
-                ln = ln.strip()
-                if ln.startswith("channel "):
-                    # e.g. "channel 36 (5180 MHz), width: 80 MHz"
-                    try:
-                        ap_channel = int(ln.split()[1])
-                    except (IndexError, ValueError):
-                        pass
-                    break
-            if ap_channel:
-                break
+        ap_freq_mhz = None
+        ap_width = None
 
-        if ap_channel:
-            _, ch_err = _ssh(f"iw dev mon0 set channel {ap_channel} 2>&1")
+        iw_all, _ = _ssh("iw dev 2>/dev/null")
+        # Parse the full `iw dev` output which lists every interface with its channel
+        _cur_iface = None
+        for ln in iw_all.splitlines():
+            ln_s = ln.strip()
+            if ln_s.startswith("Interface "):
+                _cur_iface = ln_s.split()[1]
+            elif _cur_iface and _cur_iface != "mon0" and ln_s.startswith("channel "):
+                # e.g. "channel 36 (5180 MHz), width: 80 MHz, center1: 5210 MHz"
+                parts = ln_s.split()
+                try:
+                    ap_channel = int(parts[1])
+                    # Frequency is "(5180" → strip the paren
+                    ap_freq_mhz = int(parts[2].lstrip("("))
+                    # Width: find "width:" token
+                    if "width:" in ln_s:
+                        wi = parts.index("width:") if "width:" in parts else -1
+                        if wi >= 0 and wi + 1 < len(parts):
+                            ap_width = parts[wi + 1]  # e.g. "80"
+                except (IndexError, ValueError):
+                    pass
+                break  # first non-mon0 interface found
+
+        if manual_ch:
+            # User override wins; use it as-is with iw set channel
+            ch_cmd = f"iw dev mon0 set channel {manual_ch} 2>&1"
+            _, ch_err = _ssh(ch_cmd)
             if ch_err:
-                lines.append(f"⚠ mon0 channel set to {ap_channel} (warning: {ch_err})")
+                lines.append(f"⚠ mon0 channel set to {manual_ch} (manual, warning: {ch_err})")
             else:
-                lines.append(f"✓ mon0 locked to AP channel {ap_channel}")
+                lines.append(f"✓ mon0 locked to channel {manual_ch} (manual override)")
+            ap_channel = manual_ch  # treat as "known" so preflight doesn't fail
+        elif ap_channel and ap_freq_mhz:
+            # Use `set freq` with explicit width on 5 GHz for reliability
+            ht_flag = ""
+            if ap_width == "80":
+                ht_flag = "80MHz"
+            elif ap_width == "40":
+                ht_flag = "HT40+"
+            elif ap_width == "20":
+                ht_flag = "HT20"
+            ch_cmd = f"iw dev mon0 set freq {ap_freq_mhz} {ht_flag} 2>&1".strip()
+            _, ch_err = _ssh(ch_cmd)
+            if ch_err:
+                lines.append(
+                    f"⚠ mon0 tuned to {ap_freq_mhz} MHz / ch{ap_channel} "
+                    f"(width {ap_width} MHz, warning: {ch_err})"
+                )
+            else:
+                lines.append(
+                    f"✓ mon0 locked to {ap_freq_mhz} MHz / ch{ap_channel} "
+                    f"(width {ap_width or '?'} MHz)"
+                )
         else:
-            lines.append("⚠ Could not detect AP channel — mon0 may be on wrong channel")
-
-        # 5c. Verify the BFM filter works on this tcpdump build by running a
-        #     2-second test capture.  If it produces only the 24-byte header
-        #     (zero packets) try the broader action-frame filter so we know
-        #     whether it is a filter-syntax issue or simply no BFM frames.
-        if ok:
-            # Kill any existing test capture first
-            _ssh("killall tcpdump 2>/dev/null; rm -f /tmp/_preflight.pcap")
-            time.sleep(0.3)
-            _ssh(
-                "tcpdump -i mon0 -U -c 50 -w /tmp/_preflight.pcap "
-                "'wlan[24] == 21' > /tmp/_preflight.log 2>&1 &"
+            lines.append(
+                "⚠ Could not detect AP channel automatically. "
+                "Enter the channel manually in the 'mon0 channel' field and retry Setup."
             )
-            time.sleep(2)
+
+        # 5c. Progressive filter test:
+        #   Pass 1 — combined VHT+HE BFM filter (category 21 OR 30)
+        #   Pass 2 — broad any-Action-frame filter  (FC subtype 0xD0)
+        #   Pass 3 — any-frame filter (no filter expression at all)
+        # Each pass runs for 3 s.  The first pass that captures data wins and
+        # sets self._bfm_tcpdump_filter for LiveDataCollector to use.
+        # If even pass 3 gets 0 packets, mon0 is on the wrong channel.
+        if ok:
             _ssh("killall tcpdump 2>/dev/null")
             time.sleep(0.3)
 
-            sz_out, _ = _ssh("wc -c < /tmp/_preflight.pcap 2>/dev/null")
-            try:
-                pcap_bytes = int(sz_out.strip())
-            except (ValueError, AttributeError):
-                pcap_bytes = 0
+            filter_candidates = [
+                (
+                    "wlan[24] == 21 or wlan[24] == 30",
+                    "VHT+HE BFM (cat 21 or 30)",
+                ),
+                (
+                    "(wlan[0] & 0xfc) == 0xd0",
+                    "any Action frame (FC=0xD0)",
+                ),
+                (
+                    "",  # no filter — catch everything
+                    "no filter (all frames)",
+                ),
+            ]
 
-            filter_log, _ = _ssh("cat /tmp/_preflight.log 2>/dev/null")
-            _ssh("rm -f /tmp/_preflight.pcap /tmp/_preflight.log")
-
-            if pcap_bytes > 24:
-                bfm_pkts = (pcap_bytes - 24) // 20  # rough lower bound
-                lines.append(
-                    f"✓ BFM filter test: captured data ({pcap_bytes} bytes, "
-                    f"~{bfm_pkts}+ packets) — filter 'wlan[24]==21' works"
-                )
-            else:
-                # Zero packets with BFM filter — try broader action-frame filter
-                lines.append(
-                    f"⚠ BFM filter 'wlan[24]==21' captured 0 packets in 2 s "
-                    f"(file={pcap_bytes} B)"
-                )
-                if filter_log:
-                    lines.append(f"  tcpdump stderr: {filter_log[:200]}")
-
-                # Broad action-frame filter test
-                _ssh("killall tcpdump 2>/dev/null; rm -f /tmp/_preflight2.pcap")
-                time.sleep(0.3)
+            chosen_filter = None
+            for fexpr, fdesc in filter_candidates:
+                _ssh("killall tcpdump 2>/dev/null; rm -f /tmp/_pf.pcap")
+                time.sleep(0.2)
+                filter_arg = f"'{fexpr}'" if fexpr else ""
                 _ssh(
-                    "tcpdump -i mon0 -U -c 50 -w /tmp/_preflight2.pcap "
-                    "'(wlan[0] & 0xfc) == 0xd0' > /tmp/_preflight2.log 2>&1 &"
+                    f"tcpdump -i mon0 -U -c 30 -w /tmp/_pf.pcap "
+                    f"{filter_arg} > /tmp/_pf.log 2>&1 &"
                 )
-                time.sleep(2)
+                time.sleep(3)
                 _ssh("killall tcpdump 2>/dev/null")
-                time.sleep(0.3)
+                time.sleep(0.2)
 
-                sz2_out, _ = _ssh("wc -c < /tmp/_preflight2.pcap 2>/dev/null")
-                log2, _ = _ssh("cat /tmp/_preflight2.log 2>/dev/null")
-                _ssh("rm -f /tmp/_preflight2.pcap /tmp/_preflight2.log")
+                sz_raw, _ = _ssh("wc -c < /tmp/_pf.pcap 2>/dev/null")
+                pf_log, _ = _ssh("cat /tmp/_pf.log 2>/dev/null")
+                _ssh("rm -f /tmp/_pf.pcap /tmp/_pf.log")
+
                 try:
-                    pcap2_bytes = int(sz2_out.strip())
+                    pcap_bytes = int(sz_raw.strip())
                 except (ValueError, AttributeError):
-                    pcap2_bytes = 0
+                    pcap_bytes = 0
 
-                if pcap2_bytes > 24:
+                if pcap_bytes > 24:
+                    chosen_filter = fexpr
                     lines.append(
-                        f"✓ Broad action-frame filter captured data ({pcap2_bytes} B) "
-                        f"— switching to '(wlan[0] & 0xfc) == 0xd0'"
+                        f"✓ Filter test [{fdesc}]: captured {pcap_bytes} bytes — using this filter"
                     )
-                    # Store the override so LiveDataCollector picks it up
-                    self._bfm_filter_override = "(wlan[0] & 0xfc) == 0xd0"
+                    break
                 else:
                     lines.append(
-                        f"✗ Broad filter also captured 0 packets ({pcap2_bytes} B). "
-                        f"mon0 may be on wrong channel, or no WiFi traffic present."
+                        f"⚠ Filter test [{fdesc}]: 0 packets ({pcap_bytes} B)"
                     )
-                    if log2:
-                        lines.append(f"  tcpdump stderr: {log2[:200]}")
-                    # Not a hard failure — let streaming proceed; user can investigate
-                    if ap_channel is None:
-                        ok = False  # No channel AND no packets = certainly wrong setup
+                    if pf_log:
+                        lines.append(f"  stderr: {pf_log.strip()[:200]}")
+
+            if chosen_filter is None:
+                # Even the no-filter test got nothing → wrong channel or no traffic
+                lines.append(
+                    "✗ All filter tests captured 0 packets — mon0 is almost certainly "
+                    "on the wrong channel, or no WiFi clients are associated. "
+                    "Check the AP channel via `iw dev` on the router and enter it "
+                    "in the 'mon0 channel' field, then retry Setup."
+                )
+                if ap_channel is None:
+                    ok = False
+                # Even if we detected a channel, something is wrong — downgrade to warning
+                # but do NOT hard-fail so the user can still try streaming manually.
+            else:
+                # Store the winning filter so LiveDataCollector uses it
+                self._bfm_tcpdump_filter = chosen_filter
 
         # 6. Local working directories
         for d in (
