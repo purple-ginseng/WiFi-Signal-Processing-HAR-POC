@@ -90,7 +90,7 @@ def _detect_tshark():
 
 
 TSHARK_PATH = _detect_tshark()
-BUFFER_SIZE = 1000
+BUFFER_SIZE = 10000
 WINDOW_SIZE = 5
 RETRY_INTERVAL = 2.0
 ENABLE_TRAFFIC_GENERATION = True
@@ -668,8 +668,11 @@ class LiveDataCollector:
 
                 # Add packets to buffers
                 num_packets = len(df_mag_phase)
+                pc_now = time.time()
                 for idx, row in df_mag_phase.iterrows():
-                    self.packet_buffer.append(row.to_dict())
+                    row_dict = row.to_dict()
+                    row_dict["pc_timestamp"] = pc_now
+                    self.packet_buffer.append(row_dict)
 
                 # Also keep processed data for Doppler analysis
                 for idx, row in df_processed.iterrows():
@@ -1092,6 +1095,10 @@ class MainApp(tk.Tk):
         }
 
         try:
+            # Clear buffers to start with a clean slate for this session
+            self.bfm_collector.packet_buffer.clear()
+            self.bfm_collector.processed_buffer.clear()
+
             # Spawn the SSH+tcpdump+SFTP+tshark+preprocess pipeline
             self.bfm_collector.start_collection()
 
