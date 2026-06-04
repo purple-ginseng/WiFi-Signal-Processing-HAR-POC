@@ -274,10 +274,9 @@ class LiveDataCollector:
                 self.bfm_collector.connect()
 
                 # Sync router clock to PC wall time.
-                # OpenWrt/BusyBox `date -s "YYYY-MM-DD HH:MM:SS"` sets the
-                # system clock. We measure the skew first so we can correct
-                # packet timestamps in the session filter even if the sync
-                # command fails (e.g., read-only filesystem or restricted shell).
+                # Stop NTP *before* setting the time — OpenWrt's sysntpd can
+                # revert a `date -s` change within seconds, which would leave
+                # all captured packets with the old (stuck) timestamp.
                 try:
                     router_ts_raw, _ = self.bfm_collector.run_command(
                         "date +%s 2>/dev/null"
@@ -289,20 +288,38 @@ class LiveDataCollector:
                         f"(router is {abs(self.clock_skew_seconds):.0f}s "
                         f"{'behind' if self.clock_skew_seconds > 0 else 'ahead'} of PC)"
                     )
-                    # Attempt to set the router clock to match the PC
+                    # Stop NTP daemon so it cannot revert our clock change.
+                    # Try both the init script and a direct kill; errors are
+                    # suppressed so this never blocks the connection attempt.
+                    self.bfm_collector.run_command(
+                        "/etc/init.d/sysntpd stop 2>/dev/null; "
+                        "killall ntpd 2>/dev/null; "
+                        "true"
+                    )
                     curr_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     _, sync_err = self.bfm_collector.run_command(
                         f'date -s "{curr_time_str}" 2>&1'
                     )
                     if sync_err and "invalid" in sync_err.lower():
                         print(f"[Connection] Clock sync failed: {sync_err.strip()}")
-                        # skew_seconds stays as measured — filter will compensate
                     else:
-                        print(f"[Connection] Router clock synced to: {curr_time_str}")
-                        self.clock_skew_seconds = 0.0
+                        # Verify the clock actually took — NTP sometimes reverts
+                        # within the same second if the stop command arrived late.
+                        router_ts_after, _ = self.bfm_collector.run_command(
+                            "date +%s 2>/dev/null"
+                        )
+                        router_ts_after = float(router_ts_after.strip())
+                        residual_skew = abs(time.time() - router_ts_after)
+                        if residual_skew > 60:
+                            print(
+                                f"[Connection] ⚠️ Clock sync incomplete — "
+                                f"residual skew {residual_skew:.0f}s. NTP may still be running."
+                            )
+                        else:
+                            print(f"[Connection] Router clock synced to: {curr_time_str} (skew now {residual_skew:.0f}s)")
+                            self.clock_skew_seconds = 0.0
                 except Exception as ex:
                     print(f"[Connection] Router clock sync failed: {ex}")
-                    # Leave clock_skew_seconds at 0; filter will use PC time
 
                 # Traffic generation — same logic as pages/live_activity_detection.py
                 # which is confirmed working (BFM frames get captured when a WiFi

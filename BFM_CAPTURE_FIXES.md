@@ -203,30 +203,71 @@ A yield consistently below 10% indicates a channel mismatch or non-BFM traffic.
 
 **Problem:** The download/processing pipeline runs continuously between labeled
 sessions (so preflight doesn't need to re-run). At the start of a new session,
-three contamination paths existed:
+two contamination paths existed:
 
 | Path | Effect |
 |------|--------|
 | `packet_buffer` not cleared | Session 2's CSV included all packets ever captured |
 | `download_queue` not cleared | Pcap files queued at the tail of session 1 were processed into session 2 |
-| No timestamp guard | A pcap straddling the session boundary injected old rows |
 
-**Fix (3 layers):**
+**Fix:**
 
-1. **Queue clearing** at session start:
-   ```python
-   self.bfm_collector.download_queue.clear()
-   self.bfm_collector.packet_buffer.clear()
-   self.bfm_collector.processed_buffer.clear()
-   ```
+Queue clearing at session start:
+```python
+self.bfm_collector.download_queue.clear()
+self.bfm_collector.packet_buffer.clear()
+self.bfm_collector.processed_buffer.clear()
+```
 
-2. **Timestamp filter on in-RAM buffer**: `session_start_ts = time.time()` is
-   recorded before clearing. At save time, any row with
-   `timestamp < session_start_ts` is dropped:
-   ```python
-   ts_numeric = pd.to_numeric(df_out["timestamp"], errors="coerce")
-   df_out = df_out[ts_numeric >= session_start_ts]
-   ```
+A timestamp filter was also added but later removed (see §10) because it silently
+dropped all packets when the router clock was wrong.
 
-3. **Timestamp filter in snapshot**: `_snapshot_session_to_bfm_dirs` receives
-   `min_timestamp` and filters every merged CSV the same way.
+---
+
+## 10. Timestamp filter regression removed
+
+**Problem:** A timestamp filter (`ts >= session_start_ts`) was added to prevent
+pre-session rows from bleeding into the new session's saved CSV. When the router
+clock was wrong (behind PC by ~1 year), every packet timestamp failed the filter
+and the entire buffer was silently discarded — 0 rows saved even with a full
+`packet_buffer`.
+
+**Fix:** Removed the timestamp filter. Session isolation relies solely on queue
+clearing (§9). A diagnostic-only print shows the actual timestamp range at save
+time so clock issues are immediately visible:
+
+```
+[BFM] Packet timestamp range: 2026-06-04 14:30:25 → 2026-06-04 14:32:24 (847 rows)
+```
+
+---
+
+## 11. NTP daemon reverts clock sync — stopped before date change
+
+**Problem:** `date -s "2026-06-04..."` was succeeding (log showed "Router clock
+synced"), but OpenWrt's `sysntpd` daemon was reverting the change within seconds.
+The router's NTP had last synced to `2025-10-04 14:50:28` and continuously forced
+the clock back to that value. Every capture session produced identical timestamps,
+making different program runs indistinguishable in the data.
+
+**Fix:** Stop the NTP daemon before setting the time, then verify the clock
+actually held:
+
+```python
+# Stop NTP so it cannot revert our change
+self.bfm_collector.run_command(
+    "/etc/init.d/sysntpd stop 2>/dev/null; "
+    "killall ntpd 2>/dev/null; "
+    "true"
+)
+curr_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+self.bfm_collector.run_command(f'date -s "{curr_time_str}" 2>&1')
+
+# Verify residual skew < 60 s
+router_ts_after = float(self.bfm_collector.run_command("date +%s")[0].strip())
+residual_skew = abs(time.time() - router_ts_after)
+```
+
+If `residual_skew > 60` after the sync, a warning is printed. The NTP stop
+persists until the router is rebooted (acceptable — the router's NTP source is
+stale anyway).
