@@ -180,7 +180,9 @@ class LiveDataCollector:
         # Statistics
         self.total_downloaded = 0
         self.total_processed = 0
-        self.total_packets = 0
+        self.total_packets = 0      # BFM frames that passed the extractor
+        self.total_raw_frames = 0   # all 802.11 frames in downloaded pcaps
+        self.total_cat30_frames = 0 # HE BFM frames (cat 30) seen but not extracted
 
         # Stall-detection watchdog: if total bytes across /tmp/bfm_capture*
         # don't change for STALL_THRESHOLD seconds, the explicit tcpdump
@@ -684,7 +686,44 @@ class LiveDataCollector:
                 print(f"[Processing] {pcap_path.name}...")
                 self.total_processed += 1
 
-                # Step 1: Extract BFM data (phi/psi angles) - FAST: skip if empty
+                # ── Step 0: Count raw frames and check for HE BFM (cat 30) ──
+                # We run two quick tshark counts — no verbose output, just line
+                # counts — to get the yield denominator and warn about WiFi 6.
+                import subprocess as _sp
+                raw_frame_count = 0
+                cat30_count = 0
+                try:
+                    r = _sp.run(
+                        [self.bfm_extractor.tshark_path, "-r", str(pcap_path),
+                         "-T", "fields", "-e", "frame.number"],
+                        capture_output=True, text=True, encoding="utf-8",
+                    )
+                    raw_frame_count = r.stdout.count("\n")
+                    self.total_raw_frames += raw_frame_count
+                except Exception:
+                    pass
+
+                if raw_frame_count > 0:
+                    try:
+                        r30 = _sp.run(
+                            [self.bfm_extractor.tshark_path, "-r", str(pcap_path),
+                             "-Y", "wlan.fixed.category_code == 30",
+                             "-T", "fields", "-e", "frame.number"],
+                            capture_output=True, text=True, encoding="utf-8",
+                        )
+                        cat30_count = r30.stdout.count("\n")
+                        if cat30_count > 0:
+                            self.total_cat30_frames += cat30_count
+                            print(
+                                f"[Processing] ⚠ {cat30_count} HE BFM (cat 30 / WiFi 6) frames "
+                                f"in {pcap_path.name} — extractor only handles cat 21 (VHT). "
+                                "If your router is 802.11ax-only, these are your BFM frames "
+                                "but extraction is not yet supported."
+                            )
+                    except Exception:
+                        pass
+
+                # ── Step 1: Extract BFM data (phi/psi angles via tshark cat21) ──
                 csv_raw_path = Path("live_bfm_raw_csv") / (pcap_path.stem + ".csv")
 
                 try:
@@ -693,12 +732,35 @@ class LiveDataCollector:
                     # Most failures are "No packets" - skip silently
                     if "No packets" not in str(e):
                         print(f"[Processing] Extraction error: {e}")
+                    if raw_frame_count > 0 and cat30_count == 0:
+                        # Frames were captured but none matched cat 21 or 30 —
+                        # likely noise from wrong channel or wrong WiFi standard.
+                        print(
+                            f"[Processing] ⚠ {raw_frame_count} raw frames captured but "
+                            "0 passed the cat-21 BFM extractor and 0 were cat-30 HE. "
+                            "These are likely non-BFM frames (noise / wrong channel)."
+                        )
                     continue
 
                 if not csv_raw_path.exists():
                     continue
 
-                # Step 2: Preprocess to complex ratios
+                # Yield = BFM rows extracted ÷ raw frames captured
+                extracted_rows = 0
+                try:
+                    extracted_rows = sum(1 for _ in open(csv_raw_path)) - 1  # subtract header
+                except Exception:
+                    pass
+
+                if raw_frame_count > 0:
+                    yield_pct = 100.0 * extracted_rows / raw_frame_count
+                    status = "✓" if yield_pct > 0 else "⚠"
+                    print(
+                        f"[Processing] {status} BFM yield: {extracted_rows}/{raw_frame_count} frames "
+                        f"({yield_pct:.1f}%) are genuine VHT BFM (φ11/ψ21 parsed by tshark cat-21)"
+                    )
+
+                # ── Step 2: Preprocess to complex ratios ──
                 csv_processed_path = Path("live_bfm_processed_csv") / csv_raw_path.name
 
                 try:
@@ -712,7 +774,7 @@ class LiveDataCollector:
                 if not csv_processed_path.exists():
                     continue
 
-                # Step 3: Convert to mag/phase and add to buffer
+                # ── Step 3: Convert to mag/phase and add to buffer ──
                 df_processed = pd.read_csv(csv_processed_path)
 
                 if df_processed.empty:
@@ -736,7 +798,8 @@ class LiveDataCollector:
 
                 self.total_packets += num_packets
                 print(
-                    f"[Processing] ✓ +{num_packets} packets (buffer: {len(self.packet_buffer)}, total: {self.total_packets})"
+                    f"[Processing] ✓ +{num_packets} BFM packets → buffer: {len(self.packet_buffer)}, "
+                    f"total BFM: {self.total_packets}, raw captured: {self.total_raw_frames}"
                 )
 
             except Exception as e:
@@ -1053,20 +1116,23 @@ class MainApp(tk.Tk):
         self.dl_var = tk.StringVar(value="Downloaded: 0")
         self.proc_var = tk.StringVar(value="Processed: 0")
         self.buf_var = tk.StringVar(value="Buffer: 0")
-        self.pkts_var = tk.StringVar(value="Packets: 0")
+        self.pkts_var = tk.StringVar(value="BFM pkts: 0")
+        self.yield_var = tk.StringVar(value="Yield: —")
+        self.cat30_var = tk.StringVar(value="")
         ttk.Label(
             status_frame, textvariable=self.status_var, font=("Helvetica", 11, "bold")
         ).grid(row=0, column=0, sticky="w", padx=4)
         ttk.Label(status_frame, textvariable=self.dl_var).grid(row=0, column=1, padx=12)
-        ttk.Label(status_frame, textvariable=self.proc_var).grid(
-            row=0, column=2, padx=12
-        )
-        ttk.Label(status_frame, textvariable=self.buf_var).grid(
-            row=0, column=3, padx=12
-        )
-        ttk.Label(status_frame, textvariable=self.pkts_var).grid(
-            row=0, column=4, padx=12
-        )
+        ttk.Label(status_frame, textvariable=self.proc_var).grid(row=0, column=2, padx=12)
+        ttk.Label(status_frame, textvariable=self.buf_var).grid(row=0, column=3, padx=12)
+        ttk.Label(status_frame, textvariable=self.pkts_var).grid(row=0, column=4, padx=12)
+        # Second row: yield and HE-BFM warning
+        ttk.Label(
+            status_frame, textvariable=self.yield_var, font=("Helvetica", 10, "bold")
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 0))
+        ttk.Label(
+            status_frame, textvariable=self.cat30_var, foreground="orange"
+        ).grid(row=1, column=3, columnspan=2, sticky="w", padx=4, pady=(2, 0))
         for c in range(5):
             status_frame.columnconfigure(c, weight=1)
 
@@ -1337,7 +1403,9 @@ class MainApp(tk.Tk):
             self.dl_var.set("Downloaded: 0")
             self.proc_var.set("Processed: 0")
             self.buf_var.set("Buffer: 0")
-            self.pkts_var.set("Packets: 0")
+            self.pkts_var.set("BFM pkts: 0")
+            self.yield_var.set("Yield: —")
+            self.cat30_var.set("")
             return
 
         if c.connected:
@@ -1351,7 +1419,28 @@ class MainApp(tk.Tk):
         self.dl_var.set(f"Downloaded: {c.total_downloaded}")
         self.proc_var.set(f"Processed: {c.total_processed}")
         self.buf_var.set(f"Buffer: {len(c.packet_buffer)}")
-        self.pkts_var.set(f"Packets: {c.total_packets}")
+        self.pkts_var.set(f"BFM pkts: {c.total_packets}")
+
+        # Yield = verified BFM frames / total raw 802.11 frames captured
+        # A high yield (>50%) means most captured frames are genuine BFM.
+        # Near-zero yield means wrong channel or non-BFM traffic is dominant.
+        if c.total_raw_frames > 0:
+            yield_pct = 100.0 * c.total_packets / c.total_raw_frames
+            color_hint = "✓" if yield_pct >= 10 else "⚠"
+            self.yield_var.set(
+                f"{color_hint} BFM yield: {c.total_packets}/{c.total_raw_frames} "
+                f"({yield_pct:.1f}%)"
+            )
+        else:
+            self.yield_var.set("Yield: waiting for data…")
+
+        if c.total_cat30_frames > 0:
+            self.cat30_var.set(
+                f"⚠ {c.total_cat30_frames} HE/WiFi-6 BFM (cat 30) frames seen — "
+                "extractor only handles VHT (cat 21)"
+            )
+        else:
+            self.cat30_var.set("")
 
     def _update_live_plots(self):
         """
