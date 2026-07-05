@@ -25,7 +25,7 @@ from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
 
-DATA_DIR = "./bfm_processed_csv"
+DATA_DIR = "./bfm_real_imag_csv"
 SUBCARRIER_PATTERN = re.compile(r"SCIDX_(-?\d+)_Ratio_(Real|Imag)", re.IGNORECASE)
 CMAPS = ["turbo", "viridis", "jet", "plasma", "inferno", "magma", "cividis", "RdYlBu_r", "twilight", "hsv"]
 
@@ -56,13 +56,14 @@ def load_bfm_dataframe(path: str) -> pd.DataFrame:
 def collect_subcarrier_columns(columns: pd.Index) -> tuple[list[int], dict[int, dict[str, str]]]:
     mapping: dict[int, dict[str, str]] = {}
     for col in columns:
-        match = SUBCARRIER_PATTERN.match(col)
-        if not match:
-            continue
-        sc_idx = int(match.group(1))
-        comp = match.group(2).lower()
-        mapping.setdefault(sc_idx, {})[comp] = col
-    filtered = {idx: comps for idx, comps in mapping.items() if "real" in comps and "imag" in comps}
+        m = SUBCARRIER_PATTERN.match(col)
+        if m:
+            sc_idx = int(m.group(1))
+            mapping.setdefault(sc_idx, {})[m.group(2).lower()] = col  # "real" or "imag"
+    filtered = {
+        idx: comps for idx, comps in mapping.items()
+        if "real" in comps and "imag" in comps
+    }
     ordered = sorted(filtered.keys())
     return ordered, filtered
 
@@ -74,28 +75,23 @@ def build_complex_matrix(cache_key: tuple[str, int]) -> tuple[np.ndarray, np.nda
     df = load_bfm_dataframe(path)
     subcarrier_ids, mapping = collect_subcarrier_columns(df.columns)
     if not subcarrier_ids:
-        raise ValueError("No SCIDX_* Ratio columns detected in the selected file.")
+        raise ValueError("No SCIDX_* columns detected. Expected SCIDX_N_Ratio_Real/Imag.")
 
     real_cols = [mapping[idx]["real"] for idx in subcarrier_ids]
     imag_cols = [mapping[idx]["imag"] for idx in subcarrier_ids]
-
-    df_real = df[real_cols].apply(pd.to_numeric, errors="coerce")
-    df_imag = df[imag_cols].apply(pd.to_numeric, errors="coerce")
-
-    # Fill NaN values with 0 to prevent downstream issues
-    df_real = df_real.fillna(0.0)
-    df_imag = df_imag.fillna(0.0)
+    df_a = df[real_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    df_b = df[imag_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
     if downsample > 1:
-        df_real = df_real.iloc[::downsample].reset_index(drop=True)
-        df_imag = df_imag.iloc[::downsample].reset_index(drop=True)
+        df_a = df_a.iloc[::downsample].reset_index(drop=True)
+        df_b = df_b.iloc[::downsample].reset_index(drop=True)
         timestamps = (
             df["timestamp"].iloc[::downsample].reset_index(drop=True) if "timestamp" in df.columns else None
         )
     else:
         timestamps = df["timestamp"] if "timestamp" in df.columns else None
 
-    complex_matrix = df_real.to_numpy(dtype=np.float32) + 1j * df_imag.to_numpy(dtype=np.float32)
+    complex_matrix = df_a.to_numpy(dtype=np.float32) + 1j * df_b.to_numpy(dtype=np.float32)
 
     # Final check: replace any inf values that might have been introduced
     complex_matrix[~np.isfinite(complex_matrix)] = 0
@@ -845,17 +841,22 @@ def main() -> None:
             default_index = i
             break
 
-    selected_file = st.sidebar.selectbox("Select Beamforming Capture", files, index=default_index)
+    selected_file = st.sidebar.selectbox(
+        "Select Beamforming Capture",
+        files,
+        index=default_index,
+        format_func=os.path.basename,
+    )
 
     state = st.session_state
     if "bfm_last_file" not in state:
         state.bfm_last_file = selected_file
     if selected_file != state.bfm_last_file:
         state.bfm_last_file = selected_file
-        state.bfm_playback_idx = 0
+        state["bfm_frame_slider"] = 0
         state.bfm_playing = False
         state.bfm_step = 25
-        state.bfm_window_size = 250
+        state["bfm_window_size"] = 250
 
     df = load_bfm_dataframe(selected_file)
     subcarrier_values, _ = collect_subcarrier_columns(df.columns)
@@ -892,14 +893,14 @@ def main() -> None:
                      help="Average phase velocity variance")
 
     state = st.session_state
-    if "bfm_playback_idx" not in state:
-        state.bfm_playback_idx = 0
+    if "bfm_frame_slider" not in state:
+        state["bfm_frame_slider"] = 0
     if "bfm_playing" not in state:
         state.bfm_playing = False
     if "bfm_step" not in state:
         state.bfm_step = 25
 
-    state.bfm_playback_idx = int(np.clip(state.bfm_playback_idx, 0, num_samples - 1))
+    state["bfm_frame_slider"] = int(np.clip(state["bfm_frame_slider"], 0, num_samples - 1))
     max_step = max(1, min(200, max(1, num_samples - 1)))
     state.bfm_step = int(np.clip(state.bfm_step, 1, max_step))
 
@@ -944,38 +945,38 @@ def main() -> None:
     st.sidebar.markdown("### Timeline playback")
     ctrl_cols = st.sidebar.columns(3)
     if ctrl_cols[0].button("⏮️", use_container_width=True):
-        state.bfm_playback_idx = 0
+        state["bfm_frame_slider"] = 0
     play_label = "⏸️ Pause" if state.bfm_playing else "▶️ Play"
     if ctrl_cols[1].button(play_label, use_container_width=True):
         state.bfm_playing = not state.bfm_playing
     if ctrl_cols[2].button("⏭️ End", use_container_width=True):
-        state.bfm_playback_idx = num_samples - 1
+        state["bfm_frame_slider"] = num_samples - 1
         state.bfm_playing = False
 
-    slider_val = st.sidebar.slider(
+    # Apply pending frame from playback loop (must happen before slider is instantiated)
+    if "bfm_frame_pending" in state:
+        state["bfm_frame_slider"] = int(np.clip(state["bfm_frame_pending"], 0, num_samples - 1))
+        del state["bfm_frame_pending"]
+
+    st.sidebar.slider(
         "Timeline index",
         min_value=0,
         max_value=num_samples - 1,
-        value=state.bfm_playback_idx,
         key="bfm_frame_slider",
     )
-    if slider_val != state.bfm_playback_idx:
-        state.bfm_playback_idx = int(slider_val)
 
-    highlight_idx = int(state.bfm_playback_idx)
+    highlight_idx = int(state["bfm_frame_slider"])
     highlight_time = float(time_axis[highlight_idx])
 
     max_window = min(num_samples, 500)
     default_window = min(250, max_window)
-    if "bfm_window_size" in state:
-        state.bfm_window_size = int(np.clip(state.bfm_window_size, 1, max_window))
-    else:
-        state.bfm_window_size = default_window if default_window > 0 else 1
+    if "bfm_window_size" not in state:
+        state["bfm_window_size"] = default_window if default_window > 0 else 1
+    state["bfm_window_size"] = int(np.clip(state["bfm_window_size"], 1, max_window))
     window_size = st.sidebar.slider(
         "Window size (samples)",
         min_value=1,
         max_value=max_window,
-        value=state.bfm_window_size,
         key="bfm_window_size",
     )
     window_size = int(window_size)
@@ -1220,10 +1221,10 @@ def main() -> None:
             state.bfm_playing = False
         else:
             next_idx = min(highlight_idx + state.bfm_step, num_samples - 1)
-            # Use FPS to determine sleep time
-            sleep_time = 1.0 / state.bfm_fps
-            time.sleep(sleep_time)
-            state.bfm_playback_idx = next_idx
+            time.sleep(1.0 / state.bfm_fps)
+            # Stage the next frame; applied to the slider key on the next rerun
+            # before the widget is instantiated, avoiding the post-instantiation write error.
+            state["bfm_frame_pending"] = next_idx
             request_rerun()
 
 

@@ -36,6 +36,58 @@ from bfmtool.preprocessor import BFMPreprocessor
 
 from functools import partial
 
+
+def convert_real_imag_to_mag_phase(df, mag_cols, phase_cols):
+    """Convert real/imag columns to magnitude/phase"""
+    import re
+
+    # Get all ratio columns
+    ratio_cols = [
+        col for col in df.columns if "Ratio_Real" in col or "Ratio_Imag" in col
+    ]
+
+    if not ratio_cols:
+        return pd.DataFrame()
+
+    # Extract subcarrier indices
+    subcarrier_pattern = re.compile(r"SCIDX_(-?\d+)_Ratio_(Real|Imag)")
+    subcarriers = set()
+
+    for col in ratio_cols:
+        match = subcarrier_pattern.match(col)
+        if match:
+            subcarriers.add(int(match.group(1)))
+
+    subcarriers = sorted(subcarriers)
+
+    # Convert to mag/phase
+    mag_phase_data = []
+
+    for idx, row in df.iterrows():
+        row_features = {}
+        if "timestamp" in df.columns:
+            row_features["timestamp"] = row["timestamp"]
+
+        for sc_idx in subcarriers:
+            real_col = f"SCIDX_{sc_idx}_Ratio_Real"
+            imag_col = f"SCIDX_{sc_idx}_Ratio_Imag"
+
+            if real_col in df.columns and imag_col in df.columns:
+                real_val = row[real_col]
+                imag_val = row[imag_col]
+
+                # Compute magnitude and phase
+                mag = np.sqrt(real_val**2 + imag_val**2)
+                phase = np.arctan2(imag_val, real_val)
+
+                row_features[f"SCIDX_{sc_idx}_Mag"] = mag
+                row_features[f"SCIDX_{sc_idx}_Phase"] = phase
+
+        mag_phase_data.append(row_features)
+
+    return pd.DataFrame(mag_phase_data)
+
+
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 DATA_DIR      = './data'
 PCAP_PATH     = './data/wifisignal.pcap'
@@ -250,8 +302,12 @@ class MainApp(tk.Tk):
         # --- Component 1: Initialization ---
         try:
 
-            self.bfm_collector.run_tcpdump()
+            # Must be set BEFORE run_tcpdump() starts the background pcap
+            # collector thread, otherwise any file it downloads before this
+            # line runs gets saved under the default 'bfm' filename instead
+            # of the labeled one.
             self.bfm_collector.filename = partial(self.generate_bfm_filename, label)
+            self.bfm_collector.run_tcpdump()
             start_ts = time.time()
             self.progress.config(maximum=duration) # Set the progress bar's max value
 
@@ -312,23 +368,135 @@ class MainApp(tk.Tk):
         finally:
             # --- Component 3: Cleanup and GUI Reset ---
             # This block runs regardless of whether an error occurred or not.
+            # Each stage is isolated in its own try/except so that a failure
+            # partway through (e.g. one corrupt pcap chunk) can't silently
+            # abort the rest of the pipeline and leave bfm_processed_csv
+            # empty with no explanation.
+            status_text, status_color = "[BFM] Collection finished, but nothing was saved.", "orange"
+
             if self.bfm_collector is not None:
-                self.bfm_collector.kill_tcpdump()
+                try:
+                    self.bfm_collector.kill_tcpdump()
+                except Exception as e:
+                    print(f"[BFM ERROR] kill_tcpdump failed: {e}")
 
                 to_be_extracted = self.bfm_collector.get_collected_files() - self.bfm_collected
-                self.bfm_extractor.extract(to_be_extracted)
-
-                to_be_processed = self.bfm_extractor.get_extracted_files() - self.bfm_extracted
-                self.bfm_preprocessor.process(to_be_processed)
-
                 self.bfm_collected.update(self.bfm_collector.get_collected_files())
-                self.bfm_extracted.update(self.bfm_extractor.get_extracted_files())
+
+                if not to_be_extracted:
+                    status_text, status_color = (
+                        "[BFM] No pcap files were captured — check that traffic is flowing "
+                        "to/from the router.",
+                        "orange",
+                    )
+                else:
+                    try:
+                        self.bfm_extractor.extract(to_be_extracted)
+                    except Exception as e:
+                        print(f"[BFM ERROR] Extraction failed: {e}")
+
+                    to_be_processed = self.bfm_extractor.get_extracted_files() - self.bfm_extracted
+                    self.bfm_extracted.update(self.bfm_extractor.get_extracted_files())
+
+                    if not to_be_processed:
+                        status_text, status_color = (
+                            "[BFM] Pcaps captured, but no valid BFM reports could be extracted "
+                            "from them.",
+                            "orange",
+                        )
+                    else:
+                        try:
+                            self.bfm_preprocessor.process(to_be_processed)
+                        except Exception as e:
+                            print(f"[BFM ERROR] Preprocessing failed: {e}")
+
+                        try:
+                            out_name, rows = self._merge_bfm_session_csv(label, to_be_processed)
+                        except Exception as e:
+                            print(f"[BFM ERROR] Merging session CSV failed: {e}")
+                            out_name, rows = None, 0
+
+                        if out_name:
+                            status_text, status_color = (
+                                f"[BFM] Saved {rows} rows → bfm_real_imag_csv/{out_name} "
+                                f"and bfm_mag_phase_csv/{out_name}",
+                                "green",
+                            )
+                        else:
+                            status_text, status_color = (
+                                "[BFM] BFM reports were extracted, but preprocessing/merging "
+                                "into a CSV failed. Check the console log.",
+                                "red",
+                            )
 
             self.progress['value'] = 0
             self.timer_label.config(text="Time Remaining: 0s")
             self.collect_btn.config(state="normal") # Re-enable the button
-            self.collect_msg.config(text=f"[BFM] Collection finished.")
-            print("[BFM] Collection finished.")
+            self.collect_msg.config(text=status_text, foreground=status_color)
+            print(status_text)
+
+    def _merge_bfm_session_csv(self, label, raw_csv_paths):
+        """
+        Merge this session's per-chunk processed CSVs (one per pcap rotation
+        chunk, written by BFMPreprocessor into bfm_processed_csv/ under the
+        same basename as their raw/pcap source) into a single
+        bfm_data_{label}_{timestamp}.csv, matching the one-file-per-session
+        convention the training notebooks expect. Two versions are written:
+        the real/imag ratios into bfm_real_imag_csv/ and the magnitude/phase
+        conversion into bfm_mag_phase_csv/ (same {label}_{timestamp} stem). The
+        per-chunk fragments are removed afterward so bfm_processed_csv doesn't
+        accumulate duplicates.
+
+        Returns (output_filename, row_count) or (None, 0) if nothing could be merged.
+        """
+        processed_dir = self.bfm_preprocessor.dir
+        processed_paths = [
+            processed_dir / os.path.basename(str(p)) for p in raw_csv_paths
+        ]
+        processed_paths = [p for p in processed_paths if p.is_file()]
+
+        if not processed_paths:
+            return None, 0
+
+        frames = []
+        for p in processed_paths:
+            try:
+                df = pd.read_csv(p)
+                if not df.empty:
+                    frames.append(df)
+            except Exception as e:
+                print(f"[BFM ERROR] Could not read {p}: {e}")
+
+        if not frames:
+            return None, 0
+
+        merged = pd.concat(frames, ignore_index=True)
+        merged["label"] = label
+
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_name = f"bfm_data_{label}_{ts}.csv"
+
+        # 1) Real/imag ratios (before conversion) → bfm_real_imag_csv/
+        real_imag_dir = "bfm_real_imag_csv"
+        os.makedirs(real_imag_dir, exist_ok=True)
+        merged.to_csv(os.path.join(real_imag_dir, out_name), index=False)
+
+        # 2) Magnitude/phase (after conversion) → bfm_mag_phase_csv/
+        mag_phase_dir = "bfm_mag_phase_csv"
+        os.makedirs(mag_phase_dir, exist_ok=True)
+        mag_phase = convert_real_imag_to_mag_phase(merged, [], [])
+        if not mag_phase.empty:
+            mag_phase["label"] = label
+            mag_phase.to_csv(os.path.join(mag_phase_dir, out_name), index=False)
+
+        # Remove the per-chunk fragments so bfm_processed_csv/ stays clean
+        for p in processed_paths:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+        return out_name, len(merged)
 
     def _toggle_bfm_setup(self):
         """
