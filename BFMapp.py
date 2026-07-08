@@ -25,7 +25,7 @@ from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
 
-DATA_DIR = "./bfm_processed_csv"
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bfm_processed_csv")
 SUBCARRIER_PATTERN = re.compile(r"SCIDX_(-?\d+)_Ratio_(Real|Imag)", re.IGNORECASE)
 CMAPS = ["turbo", "viridis", "jet", "plasma", "inferno", "magma", "cividis", "RdYlBu_r", "twilight", "hsv"]
 
