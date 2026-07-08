@@ -90,7 +90,7 @@ def _detect_tshark():
 
 
 TSHARK_PATH = _detect_tshark()
-BUFFER_SIZE = 1000
+BUFFER_SIZE = 10000
 WINDOW_SIZE = 5
 RETRY_INTERVAL = 2.0
 ENABLE_TRAFFIC_GENERATION = True
@@ -125,6 +125,8 @@ def convert_real_imag_to_mag_phase(df, mag_cols, phase_cols):
 
     for idx, row in df.iterrows():
         row_features = {}
+        if "timestamp" in df.columns:
+            row_features["timestamp"] = row["timestamp"]
 
         for sc_idx in subcarriers:
             real_col = f"SCIDX_{sc_idx}_Ratio_Real"
@@ -190,7 +192,7 @@ class LiveDataCollector:
             "killall tcpdump 2>/dev/null; "
             "rm -f /tmp/bfm_capture*; "
             "tcpdump -i mon0 -p -U -B 4096 -G 1 -W 10 -w /tmp/bfm_capture "
-            "'wlan[24] == 21' > /dev/null 2>&1 &"  # wlan[24] == 21, (wlan[0] & 0xfc) == 0xd0
+            "'wlan[24] == 21' > /dev/null 2>&1 &"
         )
 
         # Create directories for BFM pipeline
@@ -666,8 +668,11 @@ class LiveDataCollector:
 
                 # Add packets to buffers
                 num_packets = len(df_mag_phase)
+                pc_now = time.time()
                 for idx, row in df_mag_phase.iterrows():
-                    self.packet_buffer.append(row.to_dict())
+                    row_dict = row.to_dict()
+                    row_dict["pc_timestamp"] = pc_now
+                    self.packet_buffer.append(row_dict)
 
                 # Also keep processed data for Doppler analysis
                 for idx, row in df_processed.iterrows():
@@ -1090,6 +1095,10 @@ class MainApp(tk.Tk):
         }
 
         try:
+            # Clear buffers to start with a clean slate for this session
+            self.bfm_collector.packet_buffer.clear()
+            self.bfm_collector.processed_buffer.clear()
+
             # Spawn the SSH+tcpdump+SFTP+tshark+preprocess pipeline
             self.bfm_collector.start_collection()
 
@@ -1114,21 +1123,45 @@ class MainApp(tk.Tk):
             print(f"[BFM ERROR] {e}")
 
         finally:
-            # 1) Save in-RAM mag/phase buffer to ./data/ for training
+            # Save two versions of the session from the in-RAM buffers: real/imag
+            # ratios (before conversion) → bfm_real_imag_csv/, and magnitude/phase
+            # (after conversion) → bfm_mag_phase_csv/, sharing the same
+            # {label}_{timestamp} stem.
             if self.bfm_collector is not None:
-                if len(self.bfm_collector.packet_buffer) > 0:
+                if len(self.bfm_collector.processed_buffer) > 0:
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                     fname = f"bfm_data_{label}_{ts}.csv"
-                    filepath = os.path.join(DATA_DIR, fname)
-                    df_out = pd.DataFrame(list(self.bfm_collector.packet_buffer))
-                    df_out["label"] = label
-                    os.makedirs(DATA_DIR, exist_ok=True)
-                    df_out.to_csv(filepath, index=False)
+
+                    # 1) Real/imag ratios → bfm_real_imag_csv/
+                    df_real_imag = pd.DataFrame(
+                        list(self.bfm_collector.processed_buffer)
+                    )
+                    df_real_imag["label"] = label
+                    os.makedirs("bfm_real_imag_csv", exist_ok=True)
+                    df_real_imag.to_csv(
+                        os.path.join("bfm_real_imag_csv", fname), index=False
+                    )
+
+                    # 2) Magnitude/phase → bfm_mag_phase_csv/
+                    df_mag_phase = convert_real_imag_to_mag_phase(df_real_imag, [], [])
+                    os.makedirs("bfm_mag_phase_csv", exist_ok=True)
+                    if not df_mag_phase.empty:
+                        df_mag_phase["label"] = label
+                        df_mag_phase.to_csv(
+                            os.path.join("bfm_mag_phase_csv", fname), index=False
+                        )
+
                     self.collect_msg.config(
-                        text=f"Saved {len(df_out)} BFM packets → {fname}",
+                        text=(
+                            f"Saved {len(df_real_imag)} BFM packets → "
+                            f"bfm_real_imag_csv/{fname} and bfm_mag_phase_csv/{fname}"
+                        ),
                         foreground="green",
                     )
-                    print(f"[BFM] Saved {len(df_out)} records to {filepath}")
+                    print(
+                        f"[BFM] Saved {len(df_real_imag)} records to "
+                        f"bfm_real_imag_csv/{fname} and bfm_mag_phase_csv/{fname}"
+                    )
                 else:
                     self.collect_msg.config(
                         text="[BFM] Collection finished, but no packets were captured.",
@@ -1172,7 +1205,6 @@ class MainApp(tk.Tk):
 
         pcap_files = _new_files("live_bfm_pcap", snapshot_before["pcap"])
         raw_files = _new_files("live_bfm_raw_csv", snapshot_before["raw"])
-        proc_files = _new_files("live_bfm_processed_csv", snapshot_before["proc"])
 
         # 1) Merge pcaps with scapy
         if pcap_files:
@@ -1195,10 +1227,11 @@ class MainApp(tk.Tk):
             except Exception as e:
                 print(f"[Snapshot] PCAP merge failed: {e}")
 
-        # 2) Merge raw + processed CSVs with pandas (single header, all rows)
+        # 2) Merge raw CSVs with pandas (single header, all rows). The processed
+        #    (real/imag) and mag/phase session CSVs are written separately by
+        #    _do_bfm_collection into bfm_real_imag_csv/ and bfm_mag_phase_csv/.
         for src_files, dst_dir in (
             (raw_files, "bfm_raw_csv"),
-            (proc_files, "bfm_processed_csv"),
         ):
             if not src_files:
                 continue

@@ -175,5 +175,10 @@ cython_debug/
 
 # Claude Code configuration
 .claude/
+CLAUDE.md
 train_bfm_doppler.ipynb
 Cleaned and combined/bfm_data.csv
+live_bfm_pcap/
+bfm_processed_csv/unused/
+live_bfm_processed_csv/
+live_bfm_raw_csv/
