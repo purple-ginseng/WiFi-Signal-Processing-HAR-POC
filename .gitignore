@@ -182,3 +182,7 @@ live_bfm_pcap/
 bfm_processed_csv/unused/
 live_bfm_processed_csv/
 live_bfm_raw_csv/
+bfm_mag_phase_csv/
+bfm_real_imag_csv/
+bfm_pcap/
+bfm_raw_csv/

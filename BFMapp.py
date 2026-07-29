@@ -79,19 +79,19 @@ def build_complex_matrix(cache_key: tuple[str, int]) -> tuple[np.ndarray, np.nda
 
     real_cols = [mapping[idx]["real"] for idx in subcarrier_ids]
     imag_cols = [mapping[idx]["imag"] for idx in subcarrier_ids]
-    df_a = df[real_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    df_b = df[imag_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    df_real = df[real_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    df_imag = df[imag_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
 
     if downsample > 1:
-        df_a = df_a.iloc[::downsample].reset_index(drop=True)
-        df_b = df_b.iloc[::downsample].reset_index(drop=True)
+        df_real = df_real.iloc[::downsample].reset_index(drop=True)
+        df_imag = df_imag.iloc[::downsample].reset_index(drop=True)
         timestamps = (
             df["timestamp"].iloc[::downsample].reset_index(drop=True) if "timestamp" in df.columns else None
         )
     else:
         timestamps = df["timestamp"] if "timestamp" in df.columns else None
 
-    complex_matrix = df_a.to_numpy(dtype=np.float32) + 1j * df_b.to_numpy(dtype=np.float32)
+    complex_matrix = df_real.to_numpy(dtype=np.float32) + 1j * df_imag.to_numpy(dtype=np.float32)
 
     # Final check: replace any inf values that might have been introduced
     complex_matrix[~np.isfinite(complex_matrix)] = 0
