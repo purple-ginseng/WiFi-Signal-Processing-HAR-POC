@@ -2,7 +2,7 @@
 
 Device-free human activity recognition (HAR) using IEEE 802.11ac/ax **Compressed Beamforming (BFM)** reports captured from a commodity OpenWrt router. The system records BFM angles (`phi`, `psi`) emitted by associated WiFi clients, decompresses them into per-subcarrier complex channel ratios, and feeds the resulting time-frequency representation to a CNN for activity classification (e.g. *Standing* vs *Walking*).
 
-A live Streamlit page can pipe data straight from the router over SSH/SFTP and run inference in real time, including a self-ping mode that turns the router into both transmitter and receiver for radar-like sensing.
+A live Streamlit page can pipe data straight from the router over SSH/SFTP and run inference in real-time, including a self-ping mode that turns the router into both transmitter and receiver for radar-like sensing.
 
 ## Pipeline overview
 
