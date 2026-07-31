@@ -11,6 +11,13 @@ These numbers are the "before" baseline. Re-run after the codebook fix to get "a
 > varies *within* a link, which per-link inference cannot represent. The per-era
 > framing below — "Oct = (9,7) era, Jul = (6,4) era" — is wrong; it is per feedback
 > type, and both occur in the same Oct file.
+>
+> **Amended again 2026-07-31 (Test5) — see section 8.** The fix was validated on a
+> post-fix capture. It decodes correctly and restores the 8× dynamic range, but it
+> does **not** improve standing-vs-walking separability and cannot: Cohen's d is
+> mathematically invariant to the codebook. Every claim below that attributes the
+> separability collapse to the codebook bug — the TL;DR, and the section 4 reading
+> of Jul 04/Jul 31 — is therefore wrong about the cause.
 
 ---
 
@@ -389,7 +396,136 @@ the SCIDX maximum (a constant 122) as the φ maximum.
 
 ---
 
-## 8. Open items
+## 8. Post-fix validation on Test5 (2026-07-31, 18:43)
+
+First session collected **with** the codebook fix active. This is the "after" the
+document was written to receive.
+
+`bfm_data_0731_Test5_{Standing,Walking}_20260731_1843*`, present as pcap, raw angle
+CSV, real/imag and mag/phase. Unlike Test4 these keep the MAC columns and use the
+correct `_Ratio_Mag`/`_Ratio_Phase` names (commit `29439c8`), so `filter_by_mode`
+works and instruction 2 no longer applies.
+
+**Codebook, read from the frame** (section 7 method) — a single link, no MU frames,
+so per-link inference has nothing to trip over here:
+
+| File | TA | Feedback | cb | pkts | max φ | max ψ | ⇒ codebook |
+|---|---|---|---|---|---|---|---|
+| Test5 Standing | 88:a2:9e:a7:43:74 | SU | 0x1 | 1183 | 63 | 15 | (6,4) |
+| Test5 Walking | 88:a2:9e:a7:43:74 | SU | 0x1 | 1179 | 63 | 15 | (6,4) |
+
+Saturated at both 2^6−1 and 2^4−1, so the width is pinned. `infer_codebook` agrees.
+**The fix selects the right codebook.**
+
+### 8.1 Controlled before/after — same packets, only the decode differs
+
+The Test4-vs-Test5 comparison in 8.3 confounds the codebook with the session. This
+one does not: identical Test5 raw indices, decoded twice.
+
+| | phase span (rad) | phase std_t stand / walk | d (phase) | mag mean / max | mag std_t stand / walk | d (mag) |
+|---|---|---|---|---|---|---|
+| OLD hardcoded (9,7) | 0.0061 – 0.7793 | 0.0139 / 0.0164 | **+0.069** | 23.283 / 163.0 | 2.0197 / 2.4454 | +0.062 |
+| FIXED inferred (6,4) | 0.0491 – 6.2341 | 0.1108 / 0.1315 | **+0.069** | 2.635 / 20.4 | 0.2599 / 0.3148 | +0.064 |
+
+What the fix demonstrably does:
+
+- **Recovers exactly the 8× dynamic range** the commit claimed: std_t goes 0.0139 →
+  0.1108 (7.97×) and 0.0164 → 0.1315 (8.02×), and the span becomes the full
+  `[0.049, 6.234]` predicted in section 3.
+- **Makes the magnitudes physical.** Under (9,7) the antenna ratio was 23.3 on
+  average, max 163 — antenna 1 supposedly 163× antenna 2. Under (6,4) it is 2.64
+  mean, **median 1.10**, i.e. it straddles unity as a ratio of two antennas should.
+  This is the strongest single piece of evidence that (6,4) is the right decode.
+
+What it does **not** do:
+
+- **Separability is unchanged: d = +0.069 both ways, identical to three decimals.**
+  This is not a fluke of this dataset; it is forced. Decoding is affine in the
+  quantized index, φ = π(2^−b + q·2^−(b−1)), so choosing a codebook multiplies every
+  per-subcarrier std_t by one constant c. Cohen's d divides a difference of means of
+  those std_t values by their pooled standard deviation — numerator and denominator
+  both scale by c, so **d is exactly invariant to the codebook.** The fix cannot
+  improve phase separability, by construction.
+- Magnitude d moves only +0.062 → +0.064. `cot(ψ)` is non-linear so d is not
+  formally invariant there, but empirically it barely moves.
+
+### 8.2 A new problem the fix introduces: phase wrapping
+
+Pre-fix, decoded φ never exceeded 0.78 rad, so it always fit in `(−π, π]` and
+storing it as real/imag was lossless. Post-fix the true φ spans up to 6.23 rad,
+which **does not fit**, so `bfm_real_imag_csv/` now silently wraps it:
+
+| Phase treatment | std_t stand / walk | d (phase) |
+|---|---|---|
+| rebuilt from raw index, no wrap (ground truth) | 0.1108 / 0.1315 | **+0.069** |
+| as stored in `bfm_real_imag_csv/` (wrapped by `arg()`) | 0.0981 / 0.0971 | **−0.004** |
+| `np.unwrap(axis=-1)` — what `append_mag_phase` does | 3.8080 / 3.5469 | **−0.200** |
+| `np.unwrap(axis=0)` along time | 0.2464 / 0.3100 | +0.045 |
+
+Two consequences:
+
+1. **The real/imag round-trip is now lossy for phase dynamics.** It turns the true
+   d = +0.069 into −0.004 — the ±2π jumps land in the temporal std as noise.
+2. **`append_mag_phase` unwraps across subcarriers (`axis=-1`), which is actively
+   harmful here** — d = −0.200, the wrong sign and the largest magnitude in the
+   table, from an artefact. For per-subcarrier temporal statistics the unwrap axis
+   should be time (`axis=0`), which recovers +0.045 and the correct sign. This is
+   also why the first pass at this comparison produced a nonsensical phase range of
+   −21.35 to 5.15 rad.
+
+Best fix: carry the raw φ index (or an unwrapped phase column) through instead of
+reconstructing phase from real/imag.
+
+### 8.3 Test5 vs Test4, doc-style tables
+
+Both with **no** unwrap, so the two sessions are treated identically. Note this
+comparison confounds the codebook change with a different session — 8.1 is the
+controlled measurement.
+
+| Key | rows | uniq ts | dup | span (s) | rate | MAC cols |
+|---|---|---|---|---|---|---|
+| Test4 standing | 1181 | 1181 | 0.0% | 120.5 | 9.80 | no |
+| Test4 walking | 1180 | 1180 | 0.0% | 120.5 | 9.79 | no |
+| Test5 standing | 1183 | 1183 | 0.0% | 120.9 | 9.79 | **yes** |
+| Test5 walking | 1179 | 1179 | 0.0% | 120.6 | 9.78 | **yes** |
+
+| Key | mag mean | mag med | mag std | mag max | phase min | phase max |
+|---|---|---|---|---|---|---|
+| Test4 standing | 11.861 | 10.834 | 4.557 | 32.6 | 0.0061 | 0.7793 |
+| Test4 walking | 11.869 | 10.834 | 4.537 | 32.6 | 0.0061 | 0.7793 |
+| Test5 standing | 2.635 | 1.103 | 4.421 | 20.4 | −3.0925 | 3.0925 |
+| Test5 walking | 2.615 | 1.103 | 4.362 | 20.4 | −3.0925 | 3.0925 |
+
+| Key | mag std_t | phase std_t | distinct mag | distinct phase |
+|---|---|---|---|---|
+| Test4 standing | 0.3750 | 0.0169 | 30 | 44 |
+| Test4 walking | 0.5295 | 0.0225 | 30 | 44 |
+| Test5 standing | 0.2599 | 0.0981 | 55 | 166 |
+| Test5 walking | 0.3148 | 0.0971 | 58 | 180 |
+
+| Session | d (magnitude) | d (phase) | walk/stand mag | walk/stand phase |
+|---|---|---|---|---|
+| Test4 (pre-fix) | +0.315 | +0.101 | 1.412 | 1.328 |
+| Test5 (post-fix) | +0.064 | −0.004 | 1.211 | 0.990 |
+
+Quantization coverage roughly quadrupled (44 → 166/180 distinct phase values), which
+is the 8× range showing up as resolution. Separability did not improve; per 8.1 the
+codebook was never capable of changing it, so the remaining gap is a
+capture/physics question, not a decode question.
+
+### 8.4 Verdict
+
+**Effective at what it is: a decode-correctness fix.** Right codebook, 8× range
+restored, physically sensible magnitudes, confirmed against the frame.
+
+**Not effective as a separability fix**, which is how the branch motivated it. The
+commit's claim that the bug "collapses standing-vs-walking separability" does not
+hold — the affine scaling that destroys dynamic range leaves Cohen's d untouched.
+The low separability in Jul-era data has a different, still-unidentified cause.
+
+---
+
+## 9. Open items
 
 1. ~~**No raw angle CSVs exist for the Jul 31 sessions.**~~ **The pcaps were located**
    (2026-07-31): `bfm_pcap/bfm_data_0731_Test4_Standing_20260731_150526.pcap` and
@@ -406,8 +542,26 @@ the SCIDX maximum (a constant 122) as the φ maximum.
 3. **Explain the negative Cohen's d in Oct 2025.** Standing varying more than walking
    is backwards. Until this is understood, Oct 2025 is a high-contrast reference, not
    a correctness baseline.
-4. **Post-fix validation target.** After re-extracting with the codebook fix, phase
-   std_t should move from ~0.02 toward the ~0.29–0.36 range, and |Cohen's d| on phase
-   should grow well beyond the +0.101 seen on Jul 31.
+4. ~~**Post-fix validation target.**~~ **Done — see section 8, and the target was
+   half wrong.** The std_t half held: it rose 8× exactly as predicted. The Cohen's d
+   half was **not achievable** — decoding is affine in the quantized index, so the
+   codebook scales every std_t by one constant and d is mathematically invariant to
+   it (measured: +0.069 under both codebooks, identical). No codebook change could
+   ever have moved separability. **Superseded by item 6.**
+6. **Find the real cause of low Jul-era separability.** With the codebook eliminated
+   as a candidate, d ≈ +0.07 on freshly collected, correctly decoded, duplicate-free
+   data is unexplained. Candidates: the single Espressif beamformer at 88:a2:9e is a
+   weaker sensing link than the Oct-era ones; iperf3 UDP traffic geometry; walking
+   path relative to the AP–client line; or the activity genuinely not perturbing this
+   link much. This is now the main open question, not the decode.
+7. **Stop losing phase to wrapping (section 8.2).** Post-fix φ spans up to 6.23 rad
+   and no longer fits in `(−π, π]`, so the real/imag round-trip in
+   `bfm_real_imag_csv/` destroys it — true d = +0.069 becomes −0.004. Carry the raw
+   φ index or an unwrapped phase column through instead.
+8. **`append_mag_phase` unwraps along the wrong axis.** `np.unwrap(..., axis=-1)` at
+   [bfmtool/utils.py:137](../bfmtool/utils.py) unwraps across subcarriers; for
+   per-subcarrier temporal statistics it should be `axis=0`. As written it yields
+   d = −0.200 on Test5 — wrong sign, largest magnitude in the table, entirely
+   artefact. It also produced a nonsensical −21.35 rad phase during this analysis.
 5. `main_gui2.py` still carries the old broken `convert_real_imag_to_mag_phase`
    (deliberately left out of `29439c8`).
