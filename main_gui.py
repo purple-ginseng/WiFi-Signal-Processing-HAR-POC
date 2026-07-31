@@ -33,59 +33,34 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from bfmtool.collector import BFMCollector
 from bfmtool.extractor import BFMExtractor
 from bfmtool.preprocessor import BFMPreprocessor
+from bfmtool.utils import append_mag_phase, get_bfm_columns
 
 from functools import partial
 
 
 def convert_real_imag_to_mag_phase(df, mag_cols, phase_cols):
-    """Convert real/imag columns to magnitude/phase"""
-    import re
+    """Convert SCIDX_i_Ratio_Real/Ratio_Imag columns to Ratio_Mag/Ratio_Phase.
 
-    # Get all ratio columns
-    ratio_cols = [
-        col for col in df.columns if "Ratio_Real" in col or "Ratio_Imag" in col
-    ]
+    Thin wrapper over bfmtool.utils.append_mag_phase so this GUI and the
+    training pipeline (combine_bfm_data.py) share a single definition. The
+    "Ratio_" prefix is load-bearing: these are |h1/h2| and arg(h1/h2) between
+    the two antennas, not absolute per-subcarrier amplitudes, and the feature
+    selectors downstream match on endswith("Ratio_Mag").
 
-    if not ratio_cols:
+    Every non-subcarrier column (timestamp, MAC addresses, label) is preserved
+    — filter_by_mode() in the combine step needs transmitter_address and
+    receiver_address.
+
+    mag_cols/phase_cols are unused; kept for call-site compatibility.
+    """
+    col_dict = get_bfm_columns(df)
+
+    if not col_dict["real_col"] or not col_dict["imag_col"]:
         return pd.DataFrame()
 
-    # Extract subcarrier indices
-    subcarrier_pattern = re.compile(r"SCIDX_(-?\d+)_Ratio_(Real|Imag)")
-    subcarriers = set()
-
-    for col in ratio_cols:
-        match = subcarrier_pattern.match(col)
-        if match:
-            subcarriers.add(int(match.group(1)))
-
-    subcarriers = sorted(subcarriers)
-
-    # Convert to mag/phase
-    mag_phase_data = []
-
-    for idx, row in df.iterrows():
-        row_features = {}
-        if "timestamp" in df.columns:
-            row_features["timestamp"] = row["timestamp"]
-
-        for sc_idx in subcarriers:
-            real_col = f"SCIDX_{sc_idx}_Ratio_Real"
-            imag_col = f"SCIDX_{sc_idx}_Ratio_Imag"
-
-            if real_col in df.columns and imag_col in df.columns:
-                real_val = row[real_col]
-                imag_val = row[imag_col]
-
-                # Compute magnitude and phase
-                mag = np.sqrt(real_val**2 + imag_val**2)
-                phase = np.arctan2(imag_val, real_val)
-
-                row_features[f"SCIDX_{sc_idx}_Mag"] = mag
-                row_features[f"SCIDX_{sc_idx}_Phase"] = phase
-
-        mag_phase_data.append(row_features)
-
-    return pd.DataFrame(mag_phase_data)
+    return append_mag_phase(df).drop(
+        columns=col_dict["real_col"] + col_dict["imag_col"]
+    )
 
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
