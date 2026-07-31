@@ -446,6 +446,17 @@ class MainApp(tk.Tk):
             return None, 0
 
         merged = pd.concat(frames, ignore_index=True)
+
+        # Chronological order matters: append_mag_phase unwraps phase along the
+        # time axis, so out-of-order rows inject false 2*pi steps. raw_csv_paths
+        # arrives here as a set difference (see _do_bfm_collection), which has no
+        # defined iteration order, so the per-chunk frames above can be
+        # concatenated in any order.
+        if "timestamp" in merged.columns:
+            merged = (merged
+                      .sort_values("timestamp", kind="stable")
+                      .reset_index(drop=True))
+
         merged["label"] = label
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
