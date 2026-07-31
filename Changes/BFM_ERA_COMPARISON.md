@@ -5,6 +5,13 @@ Measured: 2026-07-31
 Status: **diagnostic record of the problem, measured with the UNFIXED decoder.**
 These numbers are the "before" baseline. Re-run after the codebook fix to get "after".
 
+> **Amended 2026-07-31 — read section 7 before trusting sections 1–6.** The codebook
+> was later read directly from the frames with tshark. It shows the Oct 2025 baseline
+> is **also** mis-decoded (98.3% of it is SU (6,4), not (9,7)), and that codebook
+> varies *within* a link, which per-link inference cannot represent. The per-era
+> framing below — "Oct = (9,7) era, Jul = (6,4) era" — is wrong; it is per feedback
+> type, and both occur in the same Oct file.
+
 ---
 
 ## TL;DR
@@ -239,16 +246,163 @@ for era in ["Oct25", "Jul04", "Jul31"]:
 
 ---
 
-## 7. Open items
+## 7. tshark settings for the authoritative codebook read
 
-1. **No raw angle CSVs exist for the Jul 31 sessions.** `bfm_raw_csv/` and
-   `bfm_real_imag_csv/` contain no `0731` files, so Jul 31 cannot be re-decoded with
-   the codebook fix — the mag/phase CSV is lossy. **Re-collect, or locate the pcaps,
-   before trying to validate the fix on Jul 31 data.**
-2. **Confirm the codebook from the frame, not by inference.** `infer_codebook()` reads
-   the field width from the observed index range. The authoritative source is the
-   VHT/HT MIMO Control field (Codebook Information / Nb). tshark is not installed on
-   the dev Mac, so the parsing regex could not be written or verified.
+Added 2026-07-31 on a **Windows** machine that *does* have tshark, closing the
+"could not be written or verified" gap in the original open item 2. Everything in
+this section was run against the pcaps in `bfm_pcap/`, not reasoned about.
+
+```
+tshark: C:\Program Files\Wireshark\tshark.exe   (TShark 4.6.5)
+```
+
+### 7.1 The fields
+
+`tshark -G fields` confirms these exist in the `wlan` dissector:
+
+| Field | Meaning |
+|---|---|
+| `wlan.vht.mimo_control.codebookinfo` | Codebook Information bit (VHT / 802.11ac) |
+| `wlan.vht.mimo_control.feedbacktype` | 0 = SU, 1 = MU — **required**, the codebook bit alone is ambiguous |
+| `wlan.vht.mimo_control.ncindex` / `.nrindex` | Nc−1 / Nr−1; the 2×1 decompressor needs Nc=0, Nr=1 |
+| `wlan.vht.mimo_control.grouping` | Ng; changes the subcarrier count |
+| `wlan.vht.mimo_control.chanwidth` | 0/1/2/3 = 20/40/80/160 MHz |
+| `wlan.vht.compressed_beamforming_report` | raw report bytes (useful as a cross-check, see 7.3) |
+| `wlan.fixed.mimo.control.codebookinfo` | HT (802.11n) equivalent — **empty in every capture here** |
+| `wlan.he.mimo.codebook_info` | HE (802.11ax) equivalent — **empty in every capture here** |
+
+All of this repo's captures are VHT, so only the `wlan.vht.*` names matter in
+practice, but the HT/HE names are listed because the commit message referred to
+"the VHT/HT MIMO Control field" without distinguishing them.
+
+### 7.2 The mapping (802.11ac, Codebook Information subfield)
+
+**The codebook depends on Feedback Type as well as the codebook bit.** This is the
+detail that makes range inference disagree with the frame:
+
+| Feedback Type | Codebook Information | (φ bits, ψ bits) |
+|---|---|---|
+| SU (0) | 0 | (4, 2) |
+| SU (0) | 1 | **(6, 4)** |
+| MU (1) | 0 | (7, 5) |
+| MU (1) | 1 | **(9, 7)** |
+
+Reading `codebookinfo == 1` as "(9,7)" without checking the feedback type is wrong
+for every SU frame, which is the overwhelming majority of this repo's data.
+
+### 7.3 Verification
+
+Two independent checks, both agreeing with the table above.
+
+**Observed index saturation** (max over every subcarrier of every packet):
+
+| File | Feedback | cb | pkts | max φ | max ψ | ⇒ codebook |
+|---|---|---|---|---|---|---|
+| `..._matthew_..._20251011_145538` | SU | 0x1 | 1004 | 63 | 15 | (6,4) |
+| `..._matthew_..._20251011_145538` | MU | 0x1 | 230 | 511 | 127 | (9,7) |
+| `bfm_data_0731_Test4_Standing_...150526` | SU | 0x1 | 1181 | 63 | 13 | (6,4) |
+
+Both saturate exactly at 2^b−1, so the widths are pinned, not lower bounds.
+
+**Report length arithmetic.** `wlan.vht.compressed_beamforming_report` is 294 bytes
+for the Jul 31 packets. For Nc=1, Nr=2, 80 MHz, Ng=1 there are 234 angle pairs:
+`ceil(234 × (6+4) / 8) + 1 SNR byte = 294` ✓, whereas (9,7) would need
+`ceil(234 × 16 / 8) + 1 = 469`. tshark also emits exactly 234 subcarriers per packet,
+which is only possible if it unpacked at 10 bits per subcarrier. So tshark is
+already unpacking with the correct width — the raw indices in `bfm_raw_csv/` are
+correct, and the bug is purely in `decompress_bfm_from_angles`'s index→radian step.
+
+### 7.4 Two ways to read it
+
+Fast, for auditing a whole file (no `-V` parsing):
+
+```bash
+tshark -r FILE.pcap -Y "wlan.fixed.category_code == 21" -T fields \
+  -e frame.time_epoch -e wlan.ta -e wlan.ra \
+  -e wlan.vht.mimo_control.feedbacktype -e wlan.vht.mimo_control.codebookinfo \
+  -e wlan.vht.mimo_control.ncindex -e wlan.vht.mimo_control.nrindex
+```
+
+For `BFMExtractor`, which already runs `tshark -V` and regexes the output, no new
+tshark call is needed — the two lines are already in the dissection it parses:
+
+```
+            .... .... .... .1.. .... .... = Codebook Information: 0x1
+            .... .... .... 1... .... .... = Feedback Type: MU (0x1)
+```
+
+These regexes are verified against the literal lines above:
+
+```python
+CODEBOOK_RE = re.compile(r"=\s*Codebook Information:\s*0x([0-9a-fA-F]+)")
+FEEDBACK_RE = re.compile(r"=\s*Feedback Type:\s*(SU|MU)\s*\(0x([0-9a-fA-F]+)\)")
+CODEBOOK_MAP = {("SU", 0): (4, 2), ("SU", 1): (6, 4),
+                ("MU", 0): (7, 5), ("MU", 1): (9, 7)}
+```
+
+Emitting `phi_bit`/`psi_bit` as two extra per-packet columns from `parse_bfm_report`
+would let `process_bfm_dataframe` take them per row and skip inference entirely.
+
+### 7.5 What this changes about the conclusions above
+
+Running the same per-packet read on **the exact Oct 2025 file this document uses as
+its baseline** (`bfm_data_standing_abel_alt_nofoil_20251010_142840.pcap`):
+
+| Transmitter | Feedback | cb | pkts | max φ | max ψ | ⇒ codebook |
+|---|---|---|---|---|---|---|
+| ce:23:64:bb:57:4b | SU | 0x1 | **919** | 43 | 13 | (6,4) |
+| ce:23:64:bb:57:4b | MU | 0x1 | 16 | 343 | 103 | (9,7) |
+| e0:2b:e9:cc:1f:eb | MU | 0x1 | 16 | 511 | 127 | (9,7) |
+
+Two consequences, both of which contradict claims made earlier in this document:
+
+1. **"Oct 2025 is genuinely (9,7) and decoded correctly" is not right.** 919 of the
+   935 packets that survive `filter_by_mode` (98.3%) are SU (6,4) and were decoded
+   with the hardcoded (9,7) — the same defect as the Jul eras, not a clean baseline.
+   The "19–343" φ range in section 2 is the union of 919 SU packets (max 43) and
+   16 MU packets (max 343), not one wide-range distribution. This is a candidate
+   explanation for open item 3, the "backwards" negative Cohen's d.
+2. **Per-link inference is not fine-grained enough.** The codebook varies *within a
+   single (tx, rx) link* — `ce:23:64:bb:57:4b` sends both SU and MU frames. Since
+   `infer_codebook_per_link` takes the max over the link, those 16 MU packets pin
+   the link to (9,7) and mis-decode the other 919. The shipped fix therefore
+   corrects Jul-era files (SU only) but **not** Oct-era files. Codebook state has to
+   be per packet, keyed on (feedback type, codebook bit), not per link.
+
+Reproduce with:
+
+```bash
+tshark -r bfm_pcap/bfm_data_standing_abel_alt_nofoil_20251010_142840.pcap \
+  -Y "wlan.fixed.category_code == 21" -V | awk '
+function flush(){ if(key!=""){ g[key]++; if(mp>gp[key])gp[key]=mp; if(ms>gs[key])gs[key]=ms } }
+/^Frame /                 { flush(); key=""; mp=-1; ms=-1 }
+/Transmitter address:/    { ta=$NF }
+/= Codebook Information:/ { cb=$NF }
+/= Feedback Type:/        { ft=$(NF-1); key="TA="ta"  feedback="ft"  cb="cb }
+/φ11:/ { split($0,a,/[:,]/); p=a[4]+0; s=a[6]+0; if(p>mp)mp=p; if(s>ms)ms=s }
+END { flush(); for(k in g) printf "%-52s pkts=%-5d max_phi=%-4d max_psi=%-4d\n", k, g[k], gp[k], gs[k] }' | sort
+```
+
+Note the `φ11:` line splits as `SCIDX / value / φ11 / value / ψ21 / value`, so on a
+`[:,]` split φ is field 4 and ψ is field 6 — taking fields 2 and 4 silently reports
+the SCIDX maximum (a constant 122) as the φ maximum.
+
+---
+
+## 8. Open items
+
+1. ~~**No raw angle CSVs exist for the Jul 31 sessions.**~~ **The pcaps were located**
+   (2026-07-31): `bfm_pcap/bfm_data_0731_Test4_Standing_20260731_150526.pcap` and
+   `..._Walking_20260731_150809.pcap`. No re-collection needed — re-run
+   `BFMExtractor` on these to regenerate the raw angle CSVs, then re-decode with the
+   fix. (`bfm_raw_csv/` still has no `0731` files; that is the step to run.)
+2. ~~**Confirm the codebook from the frame, not by inference.**~~ **Done — see
+   section 7.** tshark 4.6.5 is installed on the Windows machine; the fields, the
+   SU/MU-dependent mapping, and the `-V` regexes are all verified against real
+   captures. Section 7.5 shows this read **contradicts the shipped per-link
+   inference on Oct-era files**, so this is now a correctness item, not a
+   nice-to-have: make the codebook per packet, keyed on (feedback type, codebook
+   bit).
 3. **Explain the negative Cohen's d in Oct 2025.** Standing varying more than walking
    is backwards. Until this is understood, Oct 2025 is a high-contrast reference, not
    a correctness baseline.

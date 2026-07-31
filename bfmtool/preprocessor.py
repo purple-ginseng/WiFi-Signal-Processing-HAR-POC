@@ -10,7 +10,16 @@ from typing import List, Optional, Tuple
 # destroys dynamic range (a 6-bit phi read as 9-bit is compressed 8x).
 #
 #   HT  (802.11n):  Nb=2 -> (4, 2),  Nb=4 -> (6, 4)
-#   VHT (802.11ac): Codebook Information 0 -> (7, 5),  1 -> (9, 7)
+#   VHT (802.11ac): the codebook depends on Feedback Type as well as the Codebook
+#                   Information bit -- the bit alone is ambiguous:
+#                       SU + 0 -> (4, 2)      SU + 1 -> (6, 4)
+#                       MU + 0 -> (7, 5)      MU + 1 -> (9, 7)
+#
+# Both fields are readable per packet from the frame itself and are the
+# authoritative source; see Changes/BFM_ERA_COMPARISON.md section 7 for the
+# verified tshark fields (wlan.vht.mimo_control.codebookinfo /
+# .feedbacktype) and the -V regexes. Reading the codebook bit without the
+# feedback type mis-decodes every SU frame, which is most of this repo's data.
 CODEBOOKS: Tuple[Tuple[int, int], ...] = ((4, 2), (6, 4), (7, 5), (9, 7))
 
 # Used when the codebook cannot be inferred (e.g. an empty capture). Matches the
@@ -125,6 +134,16 @@ def infer_codebook_per_link(df, phi_values, psi_values, locked: Optional[dict] =
     stray packets from an unrelated AP pin the codebook for everyone — which
     silently mis-decodes the link you actually care about, since the coarsest
     consistent codebook is chosen from the pooled maximum.
+
+    KNOWN LIMITATION (verified 2026-07-31, see Changes/BFM_ERA_COMPARISON.md 7.5):
+    per-link is still too coarse. The codebook is a property of the frame, not the
+    link — one beamformer sends both SU and MU frames, and those use different
+    codebooks, so a single link legitimately mixes (6,4) and (9,7). In
+    bfm_data_standing_abel_alt_nofoil_20251010_142840, 16 MU packets pin link
+    ce:23:64:bb:57:4b to (9,7) and mis-decode the other 919 SU packets. Oct-era
+    captures are therefore still wrong after this fix; Jul-era ones (SU only) are
+    not affected. The real fix is to carry the per-packet codebook out of the frame
+    in the extractor rather than infer it here.
 
     `locked` is an optional {link_key: (phi_bit, psi_bit)} carried across chunks
     of one session; it is updated in place with any newly inferred links.
