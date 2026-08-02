@@ -275,6 +275,7 @@ class MainApp(tk.Tk):
 
     def _do_bfm_collection(self, label, duration):
         # --- Component 1: Initialization ---
+        start_ts = None
         try:
 
             # Must be set BEFORE run_tcpdump() starts the background pcap
@@ -386,7 +387,9 @@ class MainApp(tk.Tk):
                             print(f"[BFM ERROR] Preprocessing failed: {e}")
 
                         try:
-                            out_name, rows = self._merge_bfm_session_csv(label, to_be_processed)
+                            out_name, rows = self._merge_bfm_session_csv(
+                                label, to_be_processed, start_ts, duration
+                            )
                         except Exception as e:
                             print(f"[BFM ERROR] Merging session CSV failed: {e}")
                             out_name, rows = None, 0
@@ -410,7 +413,7 @@ class MainApp(tk.Tk):
             self.collect_msg.config(text=status_text, foreground=status_color)
             print(status_text)
 
-    def _merge_bfm_session_csv(self, label, raw_csv_paths):
+    def _merge_bfm_session_csv(self, label, raw_csv_paths, start_ts=None, duration=None):
         """
         Merge this session's per-chunk processed CSVs (one per pcap rotation
         chunk, written by BFMPreprocessor into bfm_processed_csv/ under the
@@ -421,6 +424,13 @@ class MainApp(tk.Tk):
         conversion into bfm_mag_phase_csv/ (same {label}_{timestamp} stem). The
         per-chunk fragments are removed afterward so bfm_processed_csv doesn't
         accumulate duplicates.
+
+        tcpdump is started/stopped per session via SSH round-trips that don't
+        line up exactly with start_ts/the Python-side timer, so raw packet
+        timestamps can extend past either edge of the requested window. If
+        start_ts and duration are given, rows are trimmed to
+        [start_ts, start_ts + duration] using the 'timestamp' column
+        (epoch seconds) so the saved CSV covers exactly what was requested.
 
         Returns (output_filename, row_count) or (None, 0) if nothing could be merged.
         """
@@ -446,6 +456,13 @@ class MainApp(tk.Tk):
             return None, 0
 
         merged = pd.concat(frames, ignore_index=True)
+
+        if start_ts is not None and duration is not None and "timestamp" in merged.columns:
+            ts = pd.to_numeric(merged["timestamp"], errors="coerce")
+            merged = merged[(ts >= start_ts) & (ts <= start_ts + duration)].reset_index(drop=True)
+            if merged.empty:
+                return None, 0
+
         merged["label"] = label
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -229,7 +229,6 @@ class BFMCollector:
 
     def kill_tcpdump(self):
         self.run_command("killall tcpdump")
-        self.stop_pcap_collection()
 
     def start_pcap_collection(self):
         """Starts the background thread to monitor and download pcap files."""
