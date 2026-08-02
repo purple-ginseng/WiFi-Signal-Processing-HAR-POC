@@ -122,37 +122,7 @@ def get_df_from_dir(data_dir):
     return df_combined
 
 
-def append_mag_phase(df, unwrap_axis=0):
-    """
-    Append Ratio_Mag / Ratio_Phase columns derived from Ratio_Real / Ratio_Imag.
-
-    unwrap_axis selects the axis np.unwrap runs along. The data is
-    (rows = packets over time, columns = subcarriers):
-
-      0    unwrap along TIME, per subcarrier. This is the default and is what
-           every downstream feature wants, because the discriminative statistic
-           is the per-subcarrier standard deviation over time.
-      -1   unwrap ACROSS SUBCARRIERS, within each packet. This was the previous
-           default and is wrong for temporal features: it accumulates a ramp
-           along the subcarrier axis, so a packet's phase drifts arbitrarily far
-           from the true angle (values past -21 rad were observed) and the
-           per-subcarrier temporal std becomes mostly artefact. On the Test5
-           capture it reported Cohen's d = -0.200 where the true value is +0.069
-           -- wrong sign and 3x the magnitude. See
-           Changes/BFM_ERA_COMPARISON.md section 8.2.
-      None skip unwrapping; phase stays wrapped in (-pi, pi].
-
-    PRECONDITION for unwrap_axis=0: rows must be in chronological order. Sort by
-    timestamp first if the frame was assembled from chunks (a set of file paths
-    has no order -- see MainApp._merge_bfm_session_csv in main_gui.py).
-
-    Note that phase is reconstructed from real/imag, so it is already wrapped
-    into (-pi, pi] before this function sees it. Unwrapping recovers the true
-    angle only where the step between consecutive samples is under pi; with a
-    (6,4) codebook the true angle spans up to 6.23 rad, so this is lossy no
-    matter which axis is chosen. Carrying the raw phi index through is the
-    lossless option.
-    """
+def append_mag_phase(df):
     col_dict = get_bfm_columns(df)
 
     assert len(col_dict['real_col']) == len(col_dict['imag_col'])
@@ -164,9 +134,7 @@ def append_mag_phase(df, unwrap_axis=0):
     imag_data = df[col_dict['imag_col']].to_numpy()
 
     mag_data = (real_data**2 + imag_data ** 2) ** (1/2)
-    phase_data = np.arctan2(imag_data, real_data)
-    if unwrap_axis is not None:
-        phase_data = np.unwrap(phase_data, axis=unwrap_axis)
+    phase_data = np.unwrap(np.arctan2(imag_data, real_data))
 
     mag_col = [f'SCIDX_{scidx}_Ratio_Mag' for scidx in subcarrier_indices]
     phase_col = [f'SCIDX_{scidx}_Ratio_Phase' for scidx in subcarrier_indices]

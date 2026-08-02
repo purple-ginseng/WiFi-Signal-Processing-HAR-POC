@@ -2,100 +2,17 @@ import numpy as np
 import re
 import pandas as pd
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List
 
-# 802.11 compressed-beamforming codebooks, as (phi_bit, psi_bit) pairs ordered
-# from coarsest to finest. The angles are quantized with a codebook selected by
-# the beamformer; decoding with the wrong pair rescales every angle and silently
-# destroys dynamic range (a 6-bit phi read as 9-bit is compressed 8x).
-#
-#   HT  (802.11n):  Nb=2 -> (4, 2),  Nb=4 -> (6, 4)
-#   VHT (802.11ac): the codebook depends on Feedback Type as well as the Codebook
-#                   Information bit -- the bit alone is ambiguous:
-#                       SU + 0 -> (4, 2)      SU + 1 -> (6, 4)
-#                       MU + 0 -> (7, 5)      MU + 1 -> (9, 7)
-#
-# Both fields are readable per packet from the frame itself and are the
-# authoritative source; see Changes/BFM_ERA_COMPARISON.md section 7 for the
-# verified tshark fields (wlan.vht.mimo_control.codebookinfo /
-# .feedbacktype) and the -V regexes. Reading the codebook bit without the
-# feedback type mis-decodes every SU frame, which is most of this repo's data.
-CODEBOOKS: Tuple[Tuple[int, int], ...] = ((4, 2), (6, 4), (7, 5), (9, 7))
-
-# Used when the codebook cannot be inferred (e.g. an empty capture). Matches the
-# value this module hardcoded before the codebook became configurable.
-DEFAULT_PHI_BIT, DEFAULT_PSI_BIT = 9, 7
-
-
-def infer_codebook(phi_values, psi_values, verbose: bool = True):
-    """
-    Infer (phi_bit, psi_bit) from the observed quantized angle indices.
-
-    tshark reports phi11/psi21 as raw quantized integers, so the field width is
-    recoverable from their range: a b-bit field takes values 0..2**b-1. We pick
-    the coarsest standard codebook that can represent every observed index.
-
-    This is a lower bound, not proof. If a capture never exercises the top of
-    its range the inference will under-estimate, so the result is reported as
-    'saturated' (some index hits exactly 2**b-1, which pins the width) or
-    'unsaturated' (consistent with this codebook and any finer one). Prefer
-    passing phi_bit/psi_bit explicitly when the link configuration is known.
-
-    Returns:
-        (phi_bit, psi_bit, saturated)
-    """
-    max_phi = np.nanmax(phi_values)
-    max_psi = np.nanmax(psi_values)
-
-    if not np.isfinite(max_phi) or not np.isfinite(max_psi):
-        if verbose:
-            print("[BFM] No usable angle indices; falling back to "
-                  f"phi_bit={DEFAULT_PHI_BIT}, psi_bit={DEFAULT_PSI_BIT}.")
-        return DEFAULT_PHI_BIT, DEFAULT_PSI_BIT, False
-
-    max_phi, max_psi = int(max_phi), int(max_psi)
-
-    for phi_bit, psi_bit in CODEBOOKS:
-        if max_phi < 2 ** phi_bit and max_psi < 2 ** psi_bit:
-            saturated = (max_phi == 2 ** phi_bit - 1) or (max_psi == 2 ** psi_bit - 1)
-            if verbose:
-                confidence = "saturated" if saturated else "UNSATURATED (lower bound)"
-                print(f"[BFM] Inferred codebook phi_bit={phi_bit}, psi_bit={psi_bit} "
-                      f"from index ranges phi<={max_phi}, psi<={max_psi} [{confidence}]")
-                if not saturated:
-                    print("[BFM] WARNING: neither angle reached the top of its range, so a "
-                          "finer codebook cannot be ruled out. Pass phi_bit/psi_bit "
-                          "explicitly if you know the link configuration.")
-            return phi_bit, psi_bit, saturated
-
-    raise ValueError(
-        f"Observed angle indices (phi<={max_phi}, psi<={max_psi}) exceed every known "
-        f"802.11 codebook {CODEBOOKS}. The extractor may be misparsing the BFM report."
-    )
-
-
-def decompress_bfm_from_angles(bfm_angles, Nc, Nr,
-                               phi_bit: int = DEFAULT_PHI_BIT,
-                               psi_bit: int = DEFAULT_PSI_BIT):
+def decompress_bfm_from_angles(bfm_angles, Nc, Nr):
     """
     Decompresses BFM angles into a complex matrix using vectorized NumPy operations.
-
-    phi_bit/psi_bit select the quantization codebook and MUST match the one the
-    beamformer used; see CODEBOOKS and infer_codebook().
     """
     if Nr != 2 or Nc != 1:
         raise ValueError(f"This decompression function is for a 2x1 system, got Nr={Nr}, Nc={Nc}")
 
-    # Bit precision constants. phi_bit/psi_bit may be scalars, or 1-D arrays of
-    # length num_rows when a capture mixes links that use different codebooks —
-    # reshaped to (num_rows, 1) so they broadcast across subcarriers.
-    phi_bit = np.asarray(phi_bit, dtype=float)
-    psi_bit = np.asarray(psi_bit, dtype=float)
-    if phi_bit.ndim == 1:
-        phi_bit = phi_bit[:, None]
-    if psi_bit.ndim == 1:
-        psi_bit = psi_bit[:, None]
-
+    # Bit precision constants
+    phi_bit, psi_bit = 9, 7
     const1_phi, const2_phi = 1 / (2 ** (phi_bit - 1)), 1 / (2 ** phi_bit)
     const1_psi, const2_psi = 1 / (2 ** (psi_bit + 1)), 1 / (2 ** (psi_bit + 2))
 
@@ -121,80 +38,9 @@ def decompress_bfm_from_angles(bfm_angles, Nc, Nr,
     
     return bfm_complex
 
-LINK_COLS = ['transmitter_address', 'receiver_address']
-
-
-def infer_codebook_per_link(df, phi_values, psi_values, locked: Optional[dict] = None,
-                            verbose: bool = True):
-    """
-    Infer the codebook separately for each (transmitter, receiver) link.
-
-    The codebook is a property of the beamformer, and a monitor-mode capture
-    routinely picks up several. Inferring over a whole file lets a handful of
-    stray packets from an unrelated AP pin the codebook for everyone — which
-    silently mis-decodes the link you actually care about, since the coarsest
-    consistent codebook is chosen from the pooled maximum.
-
-    KNOWN LIMITATION (verified 2026-07-31, see Changes/BFM_ERA_COMPARISON.md 7.5):
-    per-link is still too coarse. The codebook is a property of the frame, not the
-    link — one beamformer sends both SU and MU frames, and those use different
-    codebooks, so a single link legitimately mixes (6,4) and (9,7). In
-    bfm_data_standing_abel_alt_nofoil_20251010_142840, 16 MU packets pin link
-    ce:23:64:bb:57:4b to (9,7) and mis-decode the other 919 SU packets. Oct-era
-    captures are therefore still wrong after this fix; Jul-era ones (SU only) are
-    not affected. The real fix is to carry the per-packet codebook out of the frame
-    in the extractor rather than infer it here.
-
-    `locked` is an optional {link_key: (phi_bit, psi_bit)} carried across chunks
-    of one session; it is updated in place with any newly inferred links.
-
-    Returns per-row arrays (phi_bit, psi_bit) of length len(df).
-    """
-    n = len(df)
-    phi_bits = np.empty(n, dtype=float)
-    psi_bits = np.empty(n, dtype=float)
-
-    if not all(c in df.columns for c in LINK_COLS):
-        pb, sb, _ = infer_codebook(phi_values, psi_values, verbose=verbose)
-        phi_bits[:] = pb
-        psi_bits[:] = sb
-        return phi_bits, psi_bits
-
-    # .indices gives positional row numbers per group, which is what we need to
-    # index the phi/psi arrays regardless of the frame's index.
-    positions = df.groupby(LINK_COLS, sort=False).indices
-
-    for key, rows in positions.items():
-        if locked is not None and key in locked:
-            pb, sb = locked[key]
-        else:
-            pb, sb, saturated = infer_codebook(phi_values[rows], psi_values[rows],
-                                               verbose=False)
-            if locked is not None:
-                locked[key] = (pb, sb)
-            if verbose:
-                tx, rx = key
-                flag = "" if saturated else "  [UNSATURATED - lower bound]"
-                print(f"[BFM]   link {tx} -> {rx}: {len(rows):>5} pkts, "
-                      f"phi_bit={pb}, psi_bit={sb}{flag}")
-        phi_bits[rows] = pb
-        psi_bits[rows] = sb
-
-    if verbose and len(positions) > 1:
-        print(f"[BFM] Capture mixes {len(positions)} links; each decoded with its own "
-              f"codebook. Use filter_by_mode() downstream to keep only the target link.")
-
-    return phi_bits, psi_bits
-
-
-def process_bfm_dataframe(df, phi_bit: Optional[int] = None, psi_bit: Optional[int] = None,
-                          locked_codebooks: Optional[dict] = None):
+def process_bfm_dataframe(df):
     """
     Loads and processes a BFM DataFrame using fully vectorized operations.
-
-    phi_bit/psi_bit select the quantization codebook. Leave both as None to infer
-    it per (transmitter, receiver) link from the observed angle indices; pass both
-    to force a known codebook for every row.
     """
     print(f"Original data shape: {df.shape}")
 
@@ -217,13 +63,8 @@ def process_bfm_dataframe(df, phi_bit: Optional[int] = None, psi_bit: Optional[i
     bfm_angles = np.stack([phi_values, psi_values], axis=2)
 
     # --- 2. Vectorized Decompression ---
-    if phi_bit is None or psi_bit is None:
-        phi_bit, psi_bit = infer_codebook_per_link(df, phi_values, psi_values,
-                                                   locked=locked_codebooks)
-
     # The result 'bfm_complex' will have shape (num_rows, num_subcarriers, 2)
-    bfm_complex = decompress_bfm_from_angles(bfm_angles, Nc=1, Nr=2,
-                                             phi_bit=phi_bit, psi_bit=psi_bit)
+    bfm_complex = decompress_bfm_from_angles(bfm_angles, Nc=1, Nr=2)
     
     # --- 3. Vectorized BFM-Ratio Calculation ---
     h1 = bfm_complex[:, :, 0]  # Data from Antenna 1. Shape: (num_rows, num_subcarriers)
@@ -256,34 +97,13 @@ def process_bfm_dataframe(df, phi_bit: Optional[int] = None, psi_bit: Optional[i
 
 
 class BFMPreprocessor():
-    """
-    Decodes raw BFM angle CSVs into complex antenna-ratio CSVs.
-
-    The quantization codebook may be given explicitly (phi_bit/psi_bit) or left
-    to be inferred per (transmitter, receiver) link. Inferred codebooks are
-    LOCKED per link for the lifetime of the instance: a capture session is split
-    into many one-second pcap chunks, and a short chunk may not exercise the full
-    angle range, so re-inferring per chunk would rescale different parts of the
-    same session differently. The first chunk that sees a link fixes its scale.
-    """
-
-    def __init__(self, dir : str,
-                 phi_bit: Optional[int] = None,
-                 psi_bit: Optional[int] = None):
+    def __init__(self, dir : str):
         self.dir = Path(dir)
         self.processed_file = set()
 
-        # Explicit => used for every row, never inferred.
-        self.phi_bit = phi_bit
-        self.psi_bit = psi_bit
-
-        # {(transmitter, receiver): (phi_bit, psi_bit)} accumulated across chunks.
-        self.locked_codebooks = {}
-
     def process_file(self, filepath : str, save_to : str):
         df = pd.read_csv(filepath)
-        df = process_bfm_dataframe(df, phi_bit = self.phi_bit, psi_bit = self.psi_bit,
-                                   locked_codebooks = self.locked_codebooks)
+        df = process_bfm_dataframe(df)
         df.to_csv(save_to, index = False)
         self.processed_file.add(save_to)
 
