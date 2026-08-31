@@ -127,8 +127,11 @@ class MainApp(tk.Tk):
         self._stop_csi.set()
         self._stop_pcap_transfer_loop()
 
-        # bfm close connection
-        if self.bfm_collector is not None:
+        # bfm close connection — gate on bfm_is_setup, not on bfm_collector.
+        # A failed setup leaves bfm_collector assigned but bfm_is_setup False,
+        # and _toggle_bfm_setup() branches on bfm_is_setup, so checking the
+        # collector here would re-run the *setup* branch on window close.
+        if self.bfm_is_setup:
             self._toggle_bfm_setup()
 
         self.destroy()
@@ -524,8 +527,23 @@ class MainApp(tk.Tk):
                 print("[BFM] ✅ SETUP succeeded.")
 
             except Exception as e:
-                # --- If your logic fails, show an error ---
-                messagebox.showerror(f"BFM Setup Failed\n{e}")
+                # --- If your logic fails, tear down the half-built state ---
+                # connect()/run_iperf3() can fail after the collector object
+                # exists; leaving it around makes the app look connected to
+                # anything that tests `bfm_collector is not None`.
+                try:
+                    if self.bfm_collector is not None:
+                        self.bfm_collector.close()
+                except Exception as close_error:
+                    print(f"[BFM ERROR] Cleanup after failed setup: {close_error}")
+
+                self.bfm_collector = None
+                self.bfm_extractor = None
+                self.bfm_preprocessor = None
+                self.bfm_is_setup = False
+                self.bfm_setup_btn.config(text="Setup BFM")
+
+                messagebox.showerror("BFM Setup Failed", str(e))
                 print(f"[BFM ERROR] Custom setup failed: {e}")
 
         # --- STATE 2: BFM is currently SET UP ---
@@ -534,20 +552,22 @@ class MainApp(tk.Tk):
             try:
                 self.bfm_collector.kill_iperf3()
                 self.bfm_collector.close()
-
-                self.bfm_collector = None
-                self.bfm_extractor = None
-                self.bfm_preprocessor = None
-
-                # --- If your logic succeeds, update the state and UI ---
-                self.bfm_is_setup = False
-                self.bfm_setup_btn.config(text="Setup BFM")
-                self.collect_msg.config(text="BFM connection closed.", foreground="black")
                 print("[BFM] ✅ Placeholder logic for CLOSE succeeded.")
 
             except Exception as e:
-                messagebox.showerror(f"BFM Close Error\n{e}")
+                messagebox.showerror("BFM Close Error", str(e))
                 print(f"[BFM ERROR]: {e}")
+
+            finally:
+                # Drop the state either way: a failed teardown must not leave
+                # the button stuck on "Close BFM" (and _on_close stuck in a
+                # loop of retrying it).
+                self.bfm_collector = None
+                self.bfm_extractor = None
+                self.bfm_preprocessor = None
+                self.bfm_is_setup = False
+                self.bfm_setup_btn.config(text="Setup BFM")
+                self.collect_msg.config(text="BFM connection closed.", foreground="black")
 
     def _do_csi_collection(self, label, duration, ip="0.0.0.0", port=12345):
         import math

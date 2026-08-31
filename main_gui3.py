@@ -679,9 +679,21 @@ class MainApp(tk.Tk):
         self._stop_csi.set()
         self._stop_pcap_transfer_loop()
 
-        # bfm close connection
-        if self.bfm_collector is not None:
+        # bfm close connection — gate on bfm_is_setup, not on bfm_collector.
+        # _toggle_bfm_setup() branches on bfm_is_setup, so a collector that
+        # exists without a completed setup (failed/in-flight preflight) would
+        # send us into the *setup* branch here, re-running the whole connect
+        # on window close — and its background thread would then fire
+        # self.after() callbacks against a destroyed window.
+        if self.bfm_is_setup:
             self._toggle_bfm_setup()
+        elif self.bfm_collector is not None:
+            # Partially-built collector: tear it down directly, no toggle.
+            try:
+                self.bfm_collector.stop_collection()
+            except Exception as e:
+                print(f"[BFM ERROR] Cleanup on close: {e}")
+            self.bfm_collector = None
 
         self.destroy()
 
@@ -1296,14 +1308,17 @@ class MainApp(tk.Tk):
         try:
             if self.bfm_collector is not None:
                 self.bfm_collector.stop_collection()
-                self.bfm_collector = None
-            self.bfm_is_setup = False
-            self.bfm_setup_btn.config(text="Setup BFM", state="normal")
-            self.collect_msg.config(text="BFM connection closed.", foreground="black")
             print("[BFM] ✅ CLOSE succeeded.")
         except Exception as e:
             messagebox.showerror("BFM Close Error", str(e))
             print(f"[BFM ERROR]: {e}")
+        finally:
+            # Drop the state either way: a failed teardown must not leave the
+            # button stuck on "Close BFM" with a dead collector attached.
+            self.bfm_collector = None
+            self.bfm_is_setup = False
+            self.bfm_setup_btn.config(text="Setup BFM", state="normal")
+            self.collect_msg.config(text="BFM connection closed.", foreground="black")
 
     def _do_preflight_then_setup(self):
         """Background-thread version: preflight checks, then create collector."""
@@ -1404,6 +1419,16 @@ class MainApp(tk.Tk):
             messagebox.showwarning("Setup partial", summary)
 
     def _on_preflight_failed(self, report):
+        # Drop any collector built before the failure so nothing downstream
+        # sees a half-connected object while bfm_is_setup is still False.
+        if self.bfm_collector is not None:
+            try:
+                self.bfm_collector.stop_collection()
+            except Exception as e:
+                print(f"[BFM ERROR] Cleanup after failed setup: {e}")
+            self.bfm_collector = None
+        self.bfm_is_setup = False
+
         self.bfm_setup_btn.config(text="Setup BFM", state="normal")
         self.collect_msg.config(text="Preflight failed — see dialog.", foreground="red")
         print(f"[Preflight FAILED]\n{report}")

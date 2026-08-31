@@ -189,3 +189,5 @@ bfm_real_imag_csv/
 bfm_pcap/
 bfm_raw_csv/
 .DS_Store
+# Python version pin (local venv)
+.python-version
