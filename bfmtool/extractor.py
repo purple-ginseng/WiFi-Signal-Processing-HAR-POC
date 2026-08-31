@@ -6,6 +6,8 @@ from tqdm import tqdm
 from pathlib import Path
 import subprocess
 import os
+import shutil
+import tempfile
 
 
 def get_pcap_packet_count(pcap_path):
@@ -206,15 +208,71 @@ class BFMExtractor:
         if packet_text:
             yield packet_text
 
+    def _readable_path(self, pcap_path):
+        """Return a path tshark can actually open, staging a copy if it can't.
+
+        Ubuntu 24.04+ ships an AppArmor profile (/etc/apparmor.d/tshark) that
+        confines tshark to abstractions/user-tmp plus a few system paths — it
+        grants no read access under @{HOME}. So `tshark -r ~/proj/x.pcap` dies
+        with "You don't have permission to read the file" (exit 3) even though
+        the file is owned by the caller and readable by every other tool. The
+        capture pipeline sees that as zero extractable packets.
+
+        Copying into the temp directory the profile *does* allow sidesteps it
+        without touching system security policy. On an unconfined host the
+        probe succeeds and nothing is copied.
+
+        Returns (path_to_read, staging_dir_or_None); the caller removes the
+        staging dir when done.
+        """
+        def can_read(path):
+            return subprocess.run(
+                [self.tshark_path, '-r', str(path), '-c', '1'],
+                capture_output=True, text=True
+            )
+
+        probe = can_read(pcap_path)
+        if probe.returncode == 0:
+            return str(pcap_path), None
+
+        staging_dir = tempfile.mkdtemp(prefix='bfm_tshark_')
+        staged = os.path.join(staging_dir, os.path.basename(str(pcap_path)))
+        try:
+            shutil.copy2(str(pcap_path), staged)
+        except OSError as e:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            print(f"⚠️ Could not stage {pcap_path} for tshark: {e}")
+            return str(pcap_path), None
+
+        if can_read(staged).returncode != 0:
+            # Staging didn't help (e.g. TMPDIR also lives under $HOME, or the
+            # file is genuinely unreadable). Fall back and let the normal path
+            # surface tshark's own error.
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            print(f"⚠️ tshark cannot read {pcap_path}: {probe.stderr.strip()}")
+            return str(pcap_path), None
+
+        print(f"[Extractor] tshark cannot read {pcap_path} directly "
+              f"(AppArmor profile on tshark); using a staged copy.")
+        return staged, staging_dir
+
     # Replace your pcap_to_csv method with this corrected version.
     def pcap_to_csv(self, pcap_path: str, csv_path: str):
         """
         Processes a pcap file, extracts BFM reports, and saves them to a CSV file.
         """
+        read_path, staging_dir = self._readable_path(pcap_path)
+        try:
+            return self._pcap_to_csv(read_path, csv_path, source_path=pcap_path)
+        finally:
+            if staging_dir:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
+    def _pcap_to_csv(self, pcap_path: str, csv_path: str, source_path=None):
         display_filter = "wlan.fixed.category_code == 21"
         
         # (The packet counting section remains the same as the previous correct version)
-        print(f"Pre-calculating packet count in {pcap_path}...")
+        print(f"Pre-calculating packet count in {source_path or pcap_path}...")
         count_command = [self.tshark_path, '-r', pcap_path, '-Y', display_filter]
         total_packets = 0
         try:

@@ -58,10 +58,14 @@ class BFMCollector:
     def get_filename(self):
         self.filecounter += 1
         if callable(self.filename):
-            if self.filename().endswith('.pcap'):
-                return self.filename()
-            else:
-                return f"{self.filename()}.pcap"
+            name = self.filename()
+            if name.endswith('.pcap'):
+                name = name[:-5]
+            # The counter matters here too: caller-supplied names are usually
+            # timestamped only to the second, so two chunks collected within the
+            # same second (both rotation files in the final sweep, say) would
+            # otherwise resolve to the same local path and overwrite each other.
+            return f"{name}_{self.filecounter}.pcap"
         else:
             if self.filename.endswith('.pcap'):
                 return f"{self.filename[:-5]}{self.filecounter}.pcap"
@@ -230,6 +234,95 @@ class BFMCollector:
     def kill_tcpdump(self):
         self.run_command("killall tcpdump")
 
+    # Touched after a clock correction to re-seed sysfixtime's restore anchor.
+    # Any regular file under /etc works (see sync_clock); /etc/banner is inert,
+    # so bumping its mtime has no side effect beyond the one we want.
+    CLOCK_ANCHOR = "/etc/banner"
+
+    def sync_clock(self, tolerance=60):
+        """Push this machine's time to the router, persistently.
+
+        The router has no RTC and no WAN uplink, so ntpd can never sync it —
+        system.ntp.enabled is set, but sysntpd isn't even running, and it would
+        have nothing to reach if it were. On every boot /etc/init.d/sysfixtime
+        restores the clock from the newest mtime under /etc.
+
+        That is why a bare 'date -s' never sticks: it moves the clock but not
+        the anchor, so the next boot drops straight back to whatever stale date
+        the newest /etc file carries — the same "particular time", every time.
+        Worse, it is self-perpetuating: any config written while the clock is
+        wrong re-stamps the anchor with the wrong date. So we touch a file in
+        /etc *after* setting the time, which makes the corrected time the new
+        floor for subsequent boots.
+
+        Only corrects when the drift exceeds `tolerance` seconds: /etc lives on
+        flash, and there's no reason to burn a write on every session.
+
+        Returns the remaining offset in seconds, or None if the sync failed.
+        """
+        try:
+            offset = self.get_clock_offset()
+
+            if abs(offset) <= tolerance:
+                print(f"[Clock] Router is within {tolerance}s of this machine — leaving it alone.")
+                return offset
+
+            print(
+                f"[Clock] Router clock is off by {offset:+.0f} s "
+                f"({offset / 86400:+.1f} days). Correcting..."
+            )
+            epoch = round(time.time())
+            _, error = self.run_command(
+                f"date -s @{epoch} > /dev/null && touch {self.CLOCK_ANCHOR}"
+            )
+            if error:
+                print(f"[Clock] ⚠️ Could not set the router clock: {error}")
+                return offset
+
+            remaining = self.get_clock_offset()
+            print(f"[Clock] ✅ Router clock synced (residual {remaining:+.1f} s).")
+            return remaining
+
+        except Exception as e:
+            # Never fatal: a wrong clock is handled downstream by shifting the
+            # session window with get_clock_offset() instead.
+            print(f"[Clock] ⚠️ Clock sync failed: {e}")
+            return None
+
+    def get_clock_offset(self):
+        """Seconds to add to a host epoch to express it in the router's clock.
+
+        Packet timestamps in the captured pcaps come from the router, which on
+        an OpenWrt box with no RTC and no NTP sync can sit months away from the
+        host clock (observed: 331 days behind). Anything that compares capture
+        timestamps against a host-side time.time() has to shift by this first,
+        or it will match nothing at all.
+
+        Returns 0.0 if the offset can't be determined, which leaves callers
+        with the old same-clock assumption rather than a wrong correction.
+        """
+        if not self.client:
+            return 0.0
+
+        before = time.time()
+        output, _ = self.run_command('date +%s')
+        after = time.time()
+
+        if not output:
+            return 0.0
+
+        try:
+            remote_epoch = float(output.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            print(f"[Clock] Could not parse remote date output: {output!r}")
+            return 0.0
+
+        # 'date +%s' floors to the second, so add half a second back; the host
+        # side is the midpoint of the SSH round trip.
+        offset = (remote_epoch + 0.5) - (before + after) / 2
+        print(f"[Clock] Router clock offset vs host: {offset:+.1f} s")
+        return offset
+
     def start_pcap_collection(self):
         """Starts the background thread to monitor and download pcap files."""
         if self.pcap_collector_thread and self.pcap_collector_thread.is_alive():
@@ -322,8 +415,6 @@ class BFMCollector:
             print(f"[Collector Thread] Failed to open SFTP session: {e}")
             return # Exit thread if SFTP fails
 
-        stable_candidates = {}
-
         while not self._stop_event.is_set():
             try:
                 remote_files = sftp.listdir('/tmp/')
@@ -331,11 +422,9 @@ class BFMCollector:
                 
                 # We need two files to determine which one is "complete"
                 if not pcap_files:
-                    stable_candidates.clear()
                     time.sleep(2)
                     continue
 
-                now = time.time()
                 file_stats = []
                 for f in pcap_files:
                     path = f"/tmp/{f}"
@@ -345,39 +434,17 @@ class BFMCollector:
                 # Sort by modification time to find the oldest file
                 file_stats.sort(key=lambda x: x['mtime'])
 
-                candidates = []
-
-                if len(file_stats) >= 2:
-                    # When tcpdump is rotating, the oldest file is safe to download
-                    oldest = file_stats[0]
-                    candidates.append(oldest)
-                    # Reset stability tracker for the file currently being written
-                    active_path = file_stats[-1]['path']
-                    stable_candidates = {k: v for k, v in stable_candidates.items() if k == active_path}
-                else:
-                    # Only one file available. Wait until it stays unchanged for a few cycles.
-                    sole = file_stats[0]
-                    state = stable_candidates.get(sole['path'])
-                    if state and state['mtime'] == sole['mtime'] and state['size'] == sole['size']:
-                        state['stable_checks'] += 1
-                        state['last_seen'] = now
-                    else:
-                        stable_candidates[sole['path']] = {
-                            'mtime': sole['mtime'],
-                            'size': sole['size'],
-                            'stable_checks': 1,
-                            'last_seen': now
-                        }
-
-                    # Promote to candidate after a few consecutive stable observations (> ~6 seconds)
-                    state = stable_candidates[sole['path']]
-                    if state['stable_checks'] >= 3 and state['size'] > 0:
-                        candidates.append(sole)
-
-                    # Drop stale entries not seen recently
-                    stale_keys = [k for k, v in stable_candidates.items() if now - v['last_seen'] > 30]
-                    for key in stale_keys:
-                        stable_candidates.pop(key, None)
+                # Only files tcpdump has rotated away from are safe to take:
+                # everything but the newest. The newest is the one tcpdump still
+                # holds open, and grabbing it mid-capture gives a truncated file
+                # *and* — because we remove it afterwards — leaves tcpdump
+                # writing the rest of the session into an unlinked inode, so
+                # that data is lost outright. Judging "finished" by an unchanged
+                # size/mtime is not safe either: tcpdump buffers its writes, so a
+                # low BFM report rate makes an actively-written file look idle.
+                # The still-open file is picked up by stop_pcap_collection()'s
+                # final sweep once tcpdump has exited and flushed it.
+                candidates = file_stats[:-1] if len(file_stats) >= 2 else []
 
                 for completed_file in candidates:
                     if completed_file['path'] in self._processed_files:
@@ -395,7 +462,6 @@ class BFMCollector:
                     # 3. Mark it as processed
                     self._processed_files.add(completed_file['path'])
                     self._collected_files.add(local_path)
-                    stable_candidates.pop(completed_file['path'], None)
                     print(f"[Collector Thread] ✅ Download complete. Deleted remote file.")
 
             except Exception as e:

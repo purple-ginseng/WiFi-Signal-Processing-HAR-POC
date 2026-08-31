@@ -279,6 +279,7 @@ class MainApp(tk.Tk):
     def _do_bfm_collection(self, label, duration):
         # --- Component 1: Initialization ---
         start_ts = None
+        capture_start_ts = None
         try:
 
             # Must be set BEFORE run_tcpdump() starts the background pcap
@@ -288,6 +289,13 @@ class MainApp(tk.Tk):
             self.bfm_collector.filename = partial(self.generate_bfm_filename, label)
             self.bfm_collector.run_tcpdump()
             start_ts = time.time()
+
+            # Packet timestamps in the pcap come from the router's clock, which
+            # has no RTC and usually no NTP sync, so it can be months off this
+            # machine's. _merge_bfm_session_csv() trims on those timestamps, so
+            # the window has to be expressed in router time — comparing them to
+            # a raw host time.time() drops every row of the session.
+            capture_start_ts = start_ts + self.bfm_collector.get_clock_offset()
             self.progress.config(maximum=duration) # Set the progress bar's max value
 
             # For real-time plotting
@@ -355,9 +363,17 @@ class MainApp(tk.Tk):
 
             if self.bfm_collector is not None:
                 try:
-                    self.bfm_collector.kill_tcpdump()
+                    # Not just kill_tcpdump(): the collector downloads pcaps on
+                    # a background thread, so killing tcpdump and immediately
+                    # reading get_collected_files() races that download and
+                    # reports "no pcap files were captured" for a session that
+                    # did capture data (the file then lands in bfm_pcap/ a few
+                    # seconds later, orphaned). stop_pcap_collection() joins the
+                    # thread, stops tcpdump, and sweeps whatever is still on the
+                    # router before we look at the results.
+                    self.bfm_collector.stop_pcap_collection()
                 except Exception as e:
-                    print(f"[BFM ERROR] kill_tcpdump failed: {e}")
+                    print(f"[BFM ERROR] Stopping the pcap collector failed: {e}")
 
                 to_be_extracted = self.bfm_collector.get_collected_files() - self.bfm_collected
                 self.bfm_collected.update(self.bfm_collector.get_collected_files())
@@ -391,7 +407,7 @@ class MainApp(tk.Tk):
 
                         try:
                             out_name, rows = self._merge_bfm_session_csv(
-                                label, to_be_processed, start_ts, duration
+                                label, to_be_processed, capture_start_ts, duration
                             )
                         except Exception as e:
                             print(f"[BFM ERROR] Merging session CSV failed: {e}")
@@ -462,9 +478,20 @@ class MainApp(tk.Tk):
 
         if start_ts is not None and duration is not None and "timestamp" in merged.columns:
             ts = pd.to_numeric(merged["timestamp"], errors="coerce")
-            merged = merged[(ts >= start_ts) & (ts <= start_ts + duration)].reset_index(drop=True)
-            if merged.empty:
-                return None, 0
+            trimmed = merged[(ts >= start_ts) & (ts <= start_ts + duration)].reset_index(drop=True)
+            # start_ts is expected in *router* time (see get_clock_offset). If it
+            # isn't — offset measurement failed, router clock jumped mid-session
+            # — the window matches nothing, and throwing the session away would
+            # be far worse than saving it untrimmed.
+            if trimmed.empty:
+                print(
+                    f"[BFM WARNING] No rows fall inside the requested window "
+                    f"[{start_ts:.0f}, {start_ts + duration:.0f}] but the capture "
+                    f"holds {len(merged)} rows spanning [{ts.min():.0f}, {ts.max():.0f}]. "
+                    f"Saving untrimmed — check the router's clock."
+                )
+            else:
+                merged = trimmed
 
         merged["label"] = label
 
@@ -517,6 +544,9 @@ class MainApp(tk.Tk):
                 )
 
                 self.bfm_collector.connect()
+                # Before any capture: the router's clock stamps every packet,
+                # and it has no RTC and no internet to sync against.
+                self.bfm_collector.sync_clock()
                 self.bfm_collector.run_iperf3()
 
 
