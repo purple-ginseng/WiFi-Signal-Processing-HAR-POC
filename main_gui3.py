@@ -35,6 +35,9 @@ from bfmtool.extractor import BFMExtractor
 from bfmtool.preprocessor import BFMPreprocessor
 from bfmtool.utils import append_mag_phase, get_bfm_columns
 
+import re
+import rtbfm
+
 from functools import partial
 from collections import deque
 from pathlib import Path
@@ -49,6 +52,13 @@ BATCH_SIZE_TF = 32
 BUFFER_SIZE   = 10000
 WINDOW_SIZE   = 5
 RETRY_INTERVAL = 2.0
+
+# Real-time BFM standing/walking detector configuration
+BFM_MODEL_PATHS = ['bfm_rt_model_nofoil_xgb.joblib', 'bfm_rt_model_nofoil.joblib']
+BFM_RT_MAX_GAP  = 0.15   # reject a window if >15% of its grid ticks had no packet nearby
+BFM_RT_EMA      = 0.5    # causal EMA over the probability stream
+BFM_RT_STALE_S  = 5.0    # no new packet processed for this long -> report no live data
+
 # Auto-detect tshark path based on platform
 if platform.system() == "Windows":
     TSHARK_PATH = r'C:\Program Files\Wireshark\tshark.exe'
@@ -134,16 +144,27 @@ class LiveDataCollector:
         self.total_processed = 0
         self.total_packets = 0
 
-        # Stall-detection watchdog: if total bytes across /tmp/bfm_capture*
-        # don't change for STALL_THRESHOLD seconds, the explicit tcpdump
-        # command is re-issued on the router.
-        self.STALL_THRESHOLD = 0.5
-        self._last_total_bytes = -1
+        # Stall-detection watchdog: if nothing has advanced for
+        # STALL_THRESHOLD seconds, the explicit tcpdump command is re-issued.
+        # The threshold MUST stay comfortably above the tcpdump rotation period
+        # (-G 1, so one second). 
+        self.STALL_THRESHOLD = 6.0
+        self.MAX_PENDING_CHUNKS = 15
+
+        # Most 1-second capture files we let sit on the router before dropping
+        # the oldest
+        self.MAX_REMOTE_CHUNKS = 30
+        
+        # Liveness = (router bytes, packets reaching the buffer). Bytes alone
+        # can plateau or shrink during healthy capture.
+        self._last_liveness = None
         self._last_growth_ts = 0.0
+        # No -W: with -G it caps rotations and tcpdump exits on reaching it.
+        # '_%s' gives each rotation its own file so a missed poll loses nothing.
         self._tcpdump_cmd = (
             "killall tcpdump 2>/dev/null; "
             "rm -f /tmp/bfm_capture*; "
-            "tcpdump -i mon0 -p -U -B 4096 -G 1 -W 10 -w /tmp/bfm_capture "
+            "tcpdump -i mon0 -p -U -B 4096 -G 1 -w /tmp/bfm_capture_%s "
             "'wlan[24] == 21' > /dev/null 2>&1 &"
         )
 
@@ -154,10 +175,27 @@ class LiveDataCollector:
 
         # BFM pipeline components
         self.bfm_collector = None
+        # show_progress=False skips the packet-counting pre-pass, halving the
+        # per-chunk extraction cost.
         self.bfm_extractor = BFMExtractor(
-            tshark_path=TSHARK_PATH, csv_dir="live_bfm_raw_csv"
+            tshark_path=TSHARK_PATH, csv_dir="live_bfm_raw_csv", show_progress=False
         )
         self.bfm_preprocessor = BFMPreprocessor(dir="live_bfm_processed_csv")
+
+    DEBUG_LOG = "live_bfm_debug.log"
+
+    def _log(self, msg):
+        """Print and append to DEBUG_LOG with a timestamp.
+
+        The console scrolls too fast to catch intermittent capture events.
+        """
+        line = "%s  %s" % (time.strftime("%H:%M:%S"), msg)
+        print(line, flush=True)
+        try:
+            with open(self.DEBUG_LOG, "a") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
 
     def _launch_tcpdump_explicit(self, verify=True):
         """
@@ -166,7 +204,7 @@ class LiveDataCollector:
         """
         if self.bfm_collector is None or self.bfm_collector.client is None:
             return False
-        print(f"[tcpdump] Issuing: {self._tcpdump_cmd}")
+        self._log("[LAUNCH] issuing explicit tcpdump command")
         try:
             self.bfm_collector.run_command(self._tcpdump_cmd)
         except Exception as e:
@@ -185,7 +223,7 @@ class LiveDataCollector:
             return False
         print(f"[tcpdump] ✅ running:\n  {ps_out}")
         # Reset stall watchdog so it doesn't re-fire immediately
-        self._last_total_bytes = -1
+        self._last_liveness = None
         self._last_growth_ts = time.time()
         return True
 
@@ -196,9 +234,9 @@ class LiveDataCollector:
                 print(f"[Connection] Attempting to connect to {self.host}...")
                 self.connection_status = "Connecting..."
 
-                # Create fresh BFMCollector. The explicit tcpdump command below
-                # uses time-based rotation (-G 1 -W 10), so filecount=10 matches
-                # the ring buffer size; filesize is unused on the time-based path.
+                # Create fresh BFMCollector. filesize/filecount only feed
+                # run_tcpdump(), which this class never calls -- the explicit
+                # command in _tcpdump_cmd is the single capture command.
                 self.bfm_collector = BFMCollector(
                     host=self.host,
                     username=self.user,
@@ -211,6 +249,11 @@ class LiveDataCollector:
 
                 # Establish connection
                 self.bfm_collector.connect()
+
+                # The router has no RTC and stamps packets with its own
+                # drifting clock; session trimming below compares against it,
+                # so sync before any capture starts.
+                self.bfm_collector.sync_clock()
 
                 # Traffic generation — start an iperf3 SERVER on the router so
                 # an external client (Raspberry Pi) can drive traffic to it.
@@ -257,6 +300,10 @@ class LiveDataCollector:
             return
 
         self.running = True
+        try:
+            open(self.DEBUG_LOG, "w").close()   # fresh log per run
+        except OSError:
+            pass
 
         # Start download thread (pulls pcaps from router continuously)
         self.download_thread = threading.Thread(target=self._download_loop, daemon=True)
@@ -296,6 +343,54 @@ class LiveDataCollector:
 
         self.connection_status = "Stopped"
 
+    def get_clock_offset(self):
+        """Seconds to add to a host epoch to express it in the router's clock.
+
+        Delegates to BFMCollector; returns 0.0 when unavailable so callers fall
+        back to the same-clock assumption rather than a wrong correction.
+        """
+        if self.bfm_collector is None:
+            return 0.0
+        try:
+            return self.bfm_collector.get_clock_offset()
+        except Exception as e:
+            print(f"[Clock] Offset probe failed: {e}")
+            return 0.0
+
+    def latest_processed_timestamp(self):
+        """Newest router-clock timestamp currently in processed_buffer."""
+        newest = None
+        for row in list(self.processed_buffer)[-64:]:
+            try:
+                value = float(row.get("timestamp"))
+            except (TypeError, ValueError):
+                continue
+            if newest is None or value > newest:
+                newest = value
+        return newest
+
+    def wait_for_capture_through(self, target_ts, timeout=25.0):
+        """Block until extracted data reaching target_ts has landed in the buffer.
+
+        Download (0.1 s poll), tshark extraction and preprocessing all run
+        asynchronously behind the capture, so at the instant a timed session
+        ends its final seconds are still in flight — tcpdump has yet to rotate
+        the last chunk (-G 1), let alone ship and parse it. Reading the buffer
+        right away yields a session that stops short of the requested duration.
+        Waiting for a row at or past the end of the window is the direct check
+        that the tail has arrived.
+
+        Returns True if the window was covered, False on timeout.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            newest = self.latest_processed_timestamp()
+            if newest is not None and newest >= target_ts:
+                return True
+            time.sleep(0.2)
+        print(f"[BFM] Timed out after {timeout:.0f}s waiting for the tail of the window.")
+        return False
+
     def _download_loop(self):
         """
         Download thread: Continuously pulls pcap files from router.
@@ -322,18 +417,22 @@ class LiveDataCollector:
                 # Every 10 loops (~1 second @ 0.1s sleep), verify tcpdump is still running
                 if loop_count % 10 == 0:
                     try:
+                        # Match the EXPLICIT command: a bare 'tcpdump -i mon0'
+                        # also matches a wrong capture command.
                         output, _ = self.bfm_collector.run_command(
-                            "pgrep -f 'tcpdump -i mon0'"
+                            "pgrep -f 'tcpdump -i mon0 -p -U -B 4096 -G 1'"
                         )
                         if output:
                             print(
                                 f"[Download] tcpdump health check OK (PID: {output.strip()})"
                             )
                         else:
-                            print(
-                                "[Download] ⚠️ tcpdump NOT running! Attempting to restart..."
+                            self._log(
+                                "[HEALTHCHECK] correct tcpdump NOT running -> re-issuing"
                             )
-                            self.bfm_collector.run_tcpdump()
+                            # NOT run_tcpdump(): it issues '-C 1', rotating on
+                            # size, letting one file grow for minutes.
+                            self._launch_tcpdump_explicit(verify=False)
                     except Exception as e:
                         print(f"[Download] tcpdump health check failed: {e}")
 
@@ -359,8 +458,8 @@ class LiveDataCollector:
                         tmp_files_sample = [
                             f for f in remote_files[:20]
                         ]  # First 20 files
-                        print(
-                            f"[Download] No pcap files found on router (checked for 'bfm_capture*')"
+                        self._log(
+                            "[NO-FILES] no bfm_capture* on router (skips liveness update)"
                         )
                         print(f"[Download] Files in /tmp/ (sample): {tmp_files_sample}")
                         processed_files.clear()
@@ -395,25 +494,39 @@ class LiveDataCollector:
                         continue
 
                     file_stats.sort(key=lambda x: x["mtime"])
+
+                    # Safety valve: drop rotations too old to be useful rather
+                    # than let the router's tmpfs fill.
+                    if len(file_stats) > self.MAX_REMOTE_CHUNKS:
+                        for stale in file_stats[: -self.MAX_REMOTE_CHUNKS]:
+                            try:
+                                sftp.remove(stale["path"])
+                                processed_files.pop(stale["path"], None)
+                            except Exception:
+                                pass
+                        self._log(
+                            "[BACKLOG] dropped %d stale capture file(s) on router"
+                            % (len(file_stats) - self.MAX_REMOTE_CHUNKS)
+                        )
+                        file_stats = file_stats[-self.MAX_REMOTE_CHUNKS :]
                     print(
                         f"[Download] File stats: {[(f['path'].split('/')[-1], f['size'], 'bytes') for f in file_stats]}"
                     )
 
                     # ─── Stall watchdog ────────────────────────────────────
-                    # If the total bytes across all bfm_capture* on the router
-                    # have not increased for STALL_THRESHOLD seconds, re-issue
-                    # the explicit tcpdump command. Catches the case where
-                    # tcpdump silently dies, mon0 stops sniffing, or the AP's
-                    # client stops triggering BFM frames.
+                    # Re-issue tcpdump only when neither router bytes nor
+                    # buffered packets have advanced, so an ordinary -G 1
+                    # rotation never trips it.
                     total_bytes = sum(f["size"] for f in file_stats)
+                    liveness = (total_bytes, self.total_packets)
                     now = time.time()
-                    if total_bytes != self._last_total_bytes:
-                        self._last_total_bytes = total_bytes
+                    if liveness != self._last_liveness:
+                        self._last_liveness = liveness
                         self._last_growth_ts = now
                     elif now - self._last_growth_ts >= self.STALL_THRESHOLD:
                         idle = now - self._last_growth_ts
-                        print(
-                            f"[Watchdog] No pcap growth for {idle:.1f}s — re-issuing tcpdump."
+                        self._log(
+                            f"[WATCHDOG] nothing advanced for {idle:.1f}s -> re-issuing tcpdump"
                         )
                         self._launch_tcpdump_explicit(verify=True)
                         # Reset trackers so the freshly-cleared /tmp doesn't
@@ -431,6 +544,8 @@ class LiveDataCollector:
                         candidates = file_stats[
                             :-1
                         ]  # Everything except the newest (likely active) file
+                        for _c in candidates:
+                            _c["complete"] = True   # tcpdump has moved on from these
                         single_file_tracker.clear()
                     else:
                         sole = file_stats[0]
@@ -499,10 +614,15 @@ class LiveDataCollector:
                             now_processed.append(remote_path)
                             self.total_downloaded += 1
 
-                            # DO NOT remove the remote file - let tcpdump manage rotation!
-                            # Removing files that tcpdump is writing to causes it to keep
-                            # writing to a deleted file descriptor, preventing new files.
-                            # Instead, rely on -W flag to automatically rotate files.
+                            # A fetched rotation is finished, so delete it to
+                            # bound tmpfs. Never the newest: tcpdump still
+                            # writes to it.
+                            if entry.get("complete"):
+                                try:
+                                    sftp.remove(remote_path)
+                                    processed_files.pop(remote_path, None)
+                                except Exception as e:
+                                    print(f"[Download] Could not remove {remote_path}: {e}")
 
                             single_file_tracker.pop(remote_path, None)
 
@@ -520,7 +640,9 @@ class LiveDataCollector:
                     sftp.close()
 
                 except Exception as e:
-                    print(f"[Download] SFTP error: {e}")
+                    # Skips the liveness update below, so repeated failures
+                    # trip the watchdog.
+                    self._log(f"[SFTP-ERROR] {type(e).__name__}: {e}")
 
                 time.sleep(0.1)  # Check 10 times per second for new files
 
@@ -545,6 +667,16 @@ class LiveDataCollector:
                 if not self.download_queue:
                     time.sleep(0.1)  # Wait for new files
                     continue
+
+                # A backlog means classifying stale data. Skip to the newest
+                # chunks; the detector only needs the last window_s seconds.
+                if len(self.download_queue) > self.MAX_PENDING_CHUNKS:
+                    dropped = len(self.download_queue) - self.MAX_PENDING_CHUNKS
+                    for _ in range(dropped):
+                        self.download_queue.popleft()
+                    self._log(
+                        f"[QUEUE-DROP] skipped {dropped} stale chunk(s) to bound latency"
+                    )
 
                 # Get next file from queue
                 pcap_file = self.download_queue.popleft()
@@ -648,6 +780,31 @@ class LiveDataCollector:
         return self.connection_status
 
 
+class _WidgetGroup:
+    """Several widgets that must always show the same state.
+
+    Lets every existing self.bfm_setup_btn.config(...) call site drive both
+    copies of the setup button without them drifting apart.
+    """
+
+    def __init__(self, *widgets):
+        self._widgets = list(widgets)
+
+    def add(self, widget):
+        """Register another widget, matching it to the state of the group."""
+        if self._widgets:
+            first = self._widgets[0]
+            widget.config(text=first.cget("text"), state=first.cget("state"))
+        self._widgets.append(widget)
+        return widget
+
+    def config(self, **kw):
+        for w in self._widgets:
+            w.config(**kw)
+
+    configure = config
+
+
 class MainApp(tk.Tk):
     def __init__(self):
         self.scaler = None
@@ -679,12 +836,9 @@ class MainApp(tk.Tk):
         self._stop_csi.set()
         self._stop_pcap_transfer_loop()
 
-        # bfm close connection — gate on bfm_is_setup, not on bfm_collector.
-        # _toggle_bfm_setup() branches on bfm_is_setup, so a collector that
-        # exists without a completed setup (failed/in-flight preflight) would
-        # send us into the *setup* branch here, re-running the whole connect
-        # on window close — and its background thread would then fire
-        # self.after() callbacks against a destroyed window.
+        # Gate on bfm_is_setup, not bfm_collector: a collector from a failed
+        # preflight would take _toggle_bfm_setup() into its *setup* branch and
+        # reconnect on window close.
         if self.bfm_is_setup:
             self._toggle_bfm_setup()
         elif self.bfm_collector is not None:
@@ -779,8 +933,10 @@ class MainApp(tk.Tk):
         src_menu.pack(side="left", padx=5)
         self.source_mode.trace_add("write", self._on_source_mode_changed)
 
-        self.bfm_setup_btn = ttk.Button(parent, text="Setup BFM", command=self._toggle_bfm_setup)
-        self.bfm_setup_btn.pack(pady=5)
+        setup_btn = ttk.Button(parent, text="Setup BFM", command=self._toggle_bfm_setup)
+        setup_btn.pack(pady=5)
+        # mirrored onto the prediction tab by _build_prediction_ui
+        self.bfm_setup_btn = _WidgetGroup(setup_btn)
 
         ttk.Label(parent, text="Label for this session:").pack(anchor="w", pady=(10,0))
         self.collect_label = ttk.Entry(parent)
@@ -961,6 +1117,10 @@ class MainApp(tk.Tk):
             self.collect_btn.config(state="normal")
             return
 
+        # Session start expressed in the router's clock; set once tcpdump is
+        # running so the finally block can trim to exactly the requested window.
+        capture_start_ts = None
+
         # Mark which files were already in the live dirs before this session
         snapshot_before = {
             "pcap": (
@@ -989,6 +1149,7 @@ class MainApp(tk.Tk):
             self.bfm_collector.start_collection()
 
             start_ts = time.time()
+            capture_start_ts = start_ts + self.bfm_collector.get_clock_offset()
             self.progress.config(maximum=duration)
 
             while time.time() - start_ts < duration:
@@ -1000,6 +1161,11 @@ class MainApp(tk.Tk):
                 # Plot + status refresh is driven by _streaming_tick on the main thread
                 time.sleep(0.2)
 
+            # The pipeline runs behind the clock, so hold until the window's
+            # last seconds land or the saved CSV stops short.
+            self.timer_label.config(text="Finishing capture…")
+            self.bfm_collector.wait_for_capture_through(capture_start_ts + duration)
+
         except Exception as e:
             self.collect_msg.config(text=f"Error: {e}", foreground="red")
             print(f"[BFM ERROR] {e}")
@@ -1010,14 +1176,47 @@ class MainApp(tk.Tk):
             # (after conversion) → bfm_mag_phase_csv/, sharing the same
             # {label}_{timestamp} stem.
             if self.bfm_collector is not None:
-                if len(self.bfm_collector.processed_buffer) > 0:
+                df_real_imag = pd.DataFrame(list(self.bfm_collector.processed_buffer))
+
+                # Trim to the requested duration: continuous streaming leaves
+                # chunks from before the timer started, and the drain above
+                # waits past the end. Router timestamps, hence capture_start_ts.
+                if (
+                    not df_real_imag.empty
+                    and capture_start_ts is not None
+                    and "timestamp" in df_real_imag.columns
+                ):
+                    row_ts = pd.to_numeric(df_real_imag["timestamp"], errors="coerce")
+                    window = df_real_imag[
+                        (row_ts >= capture_start_ts)
+                        & (row_ts <= capture_start_ts + duration)
+                    ].reset_index(drop=True)
+
+                    if window.empty:
+                        # capture_start_ts is expected in router time. If it
+                        # isn't — sync_clock failed, or the router clock jumped
+                        # mid-session — throwing the session away is far worse
+                        # than saving it untrimmed.
+                        print(
+                            f"[BFM WARNING] No rows inside the requested window "
+                            f"[{capture_start_ts:.0f}, {capture_start_ts + duration:.0f}] "
+                            f"but the buffer holds {len(df_real_imag)} rows spanning "
+                            f"[{row_ts.min():.0f}, {row_ts.max():.0f}]. Saving untrimmed "
+                            f"— check the router's clock."
+                        )
+                    else:
+                        df_real_imag = window
+                        span = pd.to_numeric(df_real_imag["timestamp"], errors="coerce")
+                        print(
+                            f"[BFM] Session window: {len(df_real_imag)} rows spanning "
+                            f"{span.max() - span.min():.1f}s of the {duration}s requested."
+                        )
+
+                if not df_real_imag.empty:
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                     fname = f"bfm_data_{label}_{ts}.csv"
 
                     # 1) Real/imag ratios → bfm_real_imag_csv/
-                    df_real_imag = pd.DataFrame(
-                        list(self.bfm_collector.processed_buffer)
-                    )
                     df_real_imag["label"] = label
                     os.makedirs("bfm_real_imag_csv", exist_ok=True)
                     df_real_imag.to_csv(
@@ -1365,9 +1564,8 @@ class MainApp(tk.Tk):
             messagebox.showinfo("Preflight passed", report)
             return
 
-        # Give the download thread a few seconds to SSH in, start iperf3,
-        # and launch tcpdump, then verify with `ps | grep tcpdump` and surface
-        # the result so the user sees the exact running command line.
+        # Let the download thread bring streaming up, then verify with
+        # `ps | grep tcpdump` and show the running command line.
         threading.Thread(
             target=self._verify_tcpdump_after_setup,
             args=(report,),
@@ -1767,81 +1965,217 @@ class MainApp(tk.Tk):
         messagebox.showinfo("Training Complete", "Model, PCA, and encoder saved.")
         self.train_btn.config(state="normal")
 
+    # ─── Real-time BFM prediction ──────────────────────────────────────────
+    # Standing/walking from the live stream using the train_final.py bundle.
+    # Features come from rtbfm; this section reproduces prep.py's upstream
+    # log-magnitude, phase wrap and 10 Hz resample.
+
     def _build_prediction_ui(self, parent):
         controls = ttk.Frame(parent)
         controls.pack(fill="x", pady=10)
+
+        # Mirrors the Data Collection tab's setup button so the whole
+        # real-time workflow fits on one tab.
+        self.bfm_setup_btn.add(
+            ttk.Button(controls, text="Setup BFM", command=self._toggle_bfm_setup)
+        ).pack(side="left", padx=5)
+
+        ttk.Separator(controls, orient="vertical").pack(side="left", fill="y", padx=8)
+
         self.pred_btn = ttk.Button(controls, text="Start Prediction", command=self._start_pred)
         self.pred_btn.pack(side="left", padx=5)
         self.stop_btn = ttk.Button(controls, text="Stop Prediction", command=self._stop_pred.set)
         self.stop_btn.pack(side="left", padx=5)
 
-        self.pred_label = ttk.Label(parent, text="Waiting...", font=("Helvetica", 36))
-        self.pred_label.pack(pady=50)
+        # Same StringVar as the Data Collection tab's status panel, so the
+        # existing _streaming_tick refreshes this copy for free.
+        ttk.Label(controls, textvariable=self.status_var).pack(side="left", padx=12)
 
-    # def _start_pred(self):
-    #     if not (self.pca and self.model and self.label_encoder):
-    #         messagebox.showerror("Model Missing", "Please train a model first.")
-    #         return
-    #     self._stop_pred.clear()
-    #     threading.Thread(target=self._prediction_loop, daemon=True).start()
+        self.pred_label = ttk.Label(parent, text="Waiting...", font=("Helvetica", 36))
+        self.pred_label.pack(pady=(40, 5))
+
+        self.pred_prob_label = ttk.Label(parent, text="", font=("Helvetica", 14))
+        self.pred_prob_label.pack()
+
+        self.pred_model_label = ttk.Label(parent, text="No model loaded.", foreground="gray")
+        self.pred_model_label.pack(pady=(30, 0))
+
+    def _load_bfm_rt_model(self):
+        """Load the first available bundle from BFM_MODEL_PATHS.
+
+        window_s/hop_s/fs are read from the bundle, so a retrain with a
+        different window needs no change here.
+        """
+        for path in BFM_MODEL_PATHS:
+            if not os.path.exists(path):
+                continue
+            try:
+                bundle = joblib.load(path)
+            except Exception as e:
+                messagebox.showerror("Load Error", f"Could not load {path}:\n{e}")
+                return False
+
+            self.bfm_rt_model = bundle["model"]
+            self.bfm_rt_window_s = float(bundle.get("window_s", 2.0))
+            self.bfm_rt_hop_s = float(bundle.get("hop_s", 0.5))
+            # bundles have carried the resample rate under both names
+            self.bfm_rt_fs = float(bundle.get("fs", bundle.get("frequency", 10.0)))
+            self.bfm_rt_classes = list(bundle.get("classes", ["standing", "walking"]))
+            self.bfm_rt_envs = list(bundle.get("environments", []))
+            self.bfm_rt_cols = None   # resolved from the first live packet
+
+            desc = (f"{os.path.basename(path)} — {type(self.bfm_rt_model).__name__}, "
+                    f"{self.bfm_rt_window_s:g}s window @ {self.bfm_rt_fs:g}Hz, "
+                    f"trained on {', '.join(self.bfm_rt_envs) or 'unknown'}")
+            print(f"[INFO] BFM detector loaded: {desc}")
+            self.pred_model_label.config(text=desc)
+            return True
+
+        messagebox.showerror(
+            "Model Missing",
+            "No BFM detector found. Expected one of:\n  " + "\n  ".join(BFM_MODEL_PATHS)
+            + "\n\nRun train_final.py to produce one.")
+        return False
+
+    def _resolve_bfm_rt_cols(self, row):
+        """Subcarrier column names in ascending SCIDX order, cached on first use.
+
+        Sorting keeps the live column order identical to prep.py's.
+        """
+        if self.bfm_rt_cols is not None:
+            return self.bfm_rt_cols
+        mag_re = re.compile(r"^SCIDX_(-?\d+)_Ratio_Mag$")
+        idx = sorted(int(m.group(1)) for m in map(mag_re.match, row) if m)
+        mag = [f"SCIDX_{i}_Ratio_Mag" for i in idx]
+        phase = [f"SCIDX_{i}_Ratio_Phase" for i in idx]
+        if not mag or any(c not in row for c in phase):
+            return None
+        self.bfm_rt_cols = (mag, phase)
+        print(f"[INFO] BFM detector using {len(mag)} subcarriers "
+              f"(SCIDX {idx[0]}..{idx[-1]})")
+        return self.bfm_rt_cols
+
+    def _bfm_rt_window(self):
+        """Newest window of live BFM packets on the model's uniform grid.
+
+        Returns (mag, phase, gap), or a string saying why none is available.
+        Applies prep.py's log/wrap/resample transform.
+        """
+        c = self.bfm_collector
+        if c is None or not getattr(c, "running", False):
+            return "BFM not streaming"
+
+        fs = self.bfm_rt_fs
+        T = int(round(self.bfm_rt_window_s * fs))
+
+        # Generous multiple of the expected packet count so re-ordering and
+        # duplicate drops still cover the whole span.
+        rows = list(c.packet_buffer)[-(8 * T):]
+        if len(rows) < 2:
+            return "Waiting for BFM data…"
+
+        if time.time() - float(rows[-1].get("pc_timestamp", 0.0)) > BFM_RT_STALE_S:
+            return "No live data"
+
+        cols = self._resolve_bfm_rt_cols(rows[-1])
+        if cols is None:
+            return "No subcarrier columns"
+        mag_cols, phase_cols = cols
+
+        t = np.array([r.get("timestamp", np.nan) for r in rows], dtype=np.float64)
+        finite = np.isfinite(t)
+        if finite.sum() < 2:
+            return "Waiting for BFM data…"
+        rows = [r for r, ok in zip(rows, finite) if ok]
+        t = t[finite]
+
+        # chronological order, then drop duplicate timestamps (prep.py)
+        order = np.argsort(t, kind="stable")
+        t = t[order]
+        keep = np.concatenate([[True], np.diff(t) > 0])
+        order, t = order[keep], t[keep]
+        if len(t) < 2:
+            return "Waiting for BFM data…"
+
+        # grid of T ticks spaced 1/fs, ending at the newest packet
+        grid = t[-1] - (T - 1 - np.arange(T)) / fs
+        j = np.clip(np.searchsorted(t, grid), 1, len(t) - 1)
+        pick = np.where(np.abs(t[j - 1] - grid) <= np.abs(t[j] - grid), j - 1, j)
+        gap = np.abs(t[pick] - grid) > (2.0 / fs)
+
+        sel = [rows[order[p]] for p in pick]
+        raw_mag = np.array([[r[c] for c in mag_cols] for r in sel], dtype=np.float32)
+        raw_phase = np.array([[r[c] for c in phase_cols] for r in sel], dtype=np.float64)
+
+        # prep.py: log the (heavy-tailed, multiplicative) ratio magnitudes, and
+        # wrap the phases back onto (-pi, pi]
+        mag = np.log(np.clip(raw_mag, 1e-6, None))
+        phase = np.angle(np.exp(1j * raw_phase)).astype(np.float32)
+        return mag, phase, gap
+
+    def _set_pred_text(self, label, prob=""):
+        """Update the prediction labels from the Tk main thread."""
+        def apply():
+            self.pred_label.config(text=label)
+            self.pred_prob_label.config(text=prob)
+        try:
+            self.after(0, apply)
+        except tk.TclError:
+            pass   # window already destroyed
 
     def _start_pred(self):
-        if not self.model or not self.pca or not self.label_encoder or not self.scaler:
-            if not self._load_trained_model():
+        if getattr(self, "bfm_rt_model", None) is None:
+            if not self._load_bfm_rt_model():
                 return
+        if self.bfm_collector is None or not getattr(self.bfm_collector, "running", False):
+            messagebox.showerror(
+                "BFM Not Streaming",
+                "The detector reads the live BFM stream.\n\n"
+                "Click \"Setup BFM\" first and wait for it to connect.")
+            return
+        if getattr(self, "pred_thread", None) is not None and self.pred_thread.is_alive():
+            return   # already running; a second thread would just fight over the label
         self._stop_pred.clear()
-        threading.Thread(target=self._prediction_loop, daemon=True).start()
-
-    # def _prediction_loop(self):
-    #     wifisignalz = self.chunk_size.get()
-    #     while not self._stop_pred.is_set():
-    #         try:
-    #             packets = rdpcap(PCAP_PATH)
-    #             wifisignal = np.array([len(p) for p in packets if p.haslayer(Dot11)])
-    #             if len(wifisignal) >= wifisignalz:
-    #                 window = wifisignal[-wifisignalz:].reshape(1, -1)
-    #                 feat = self.pca.transform(window)
-    #                 probs = self.model.predict(feat)[0]
-    #                 idx = np.argmax(probs)
-    #                 if probs[idx] >= self.pred_thresh.get():
-    #                     label = self.label_encoder.inverse_transform([idx])[0]
-    #                 else:
-    #                     label = "Uncertain"
-
-    #                 self.pred_label.config(text=f"{label} ({probs[idx]:.2f})")
-    #         except Exception as e:
-    #             print("Prediction error:", e)
-    #         time.sleep(1)
+        self.pred_thread = threading.Thread(target=self._prediction_loop, daemon=True)
+        self.pred_thread.start()
 
     def _prediction_loop(self):
-        wifisignalz = self.chunk_size.get()
+        """One prediction per hop, EMA-smoothed, until Stop is pressed."""
+        fs, hop = self.bfm_rt_fs, self.bfm_rt_hop_s
+        standing, walking = self.bfm_rt_classes[0], self.bfm_rt_classes[1]
+        smoothed = None
 
         while not self._stop_pred.is_set():
+            tick = time.perf_counter()
             try:
-                packets = rdpcap(PCAP_PATH)
-                rssi = np.array([len(p) for p in packets if p.haslayer(Dot11)])
-
-                if len(rssi) >= wifisignalz:
-                    window = rssi[-wifisignalz:].reshape(1, -1)
-                    window_scaled = self.scaler.transform(window)
-
-                    if self.pca:
-                        window_processed = self.pca.transform(window_scaled)
+                window = self._bfm_rt_window()
+                if isinstance(window, str):
+                    # not enough live data yet — drop the EMA state so a
+                    # resumed stream doesn't start from a stale probability
+                    self._set_pred_text(window)
+                    smoothed = None
+                else:
+                    mag, phase, gap = window
+                    if gap.mean() > BFM_RT_MAX_GAP:
+                        # too sparse to trust; hold the EMA across the dropout
+                        self._set_pred_text("Signal gap…",
+                                            f"{gap.mean():.0%} of the window had no packets")
                     else:
-                        window_processed = window_scaled
+                        feats = rtbfm.window_features(mag, phase, fs)
+                        p = float(self.bfm_rt_model.predict_proba(feats[None])[0, 1])
+                        smoothed = p if smoothed is None else BFM_RT_EMA * p + (1 - BFM_RT_EMA) * smoothed
 
-                    probs = self.model.predict(window_processed)[0]
-                    idx = np.argmax(probs)
-
-                    if probs[idx] >= self.pred_thresh.get():
-                        label = self.label_encoder.inverse_transform([idx])[0]
-                    else:
-                        label = "Uncertain"
-
-                    self.pred_label.config(text=f"{label} ({probs[idx]:.2f})")
+                        thresh = self.pred_thresh.get()
+                        label = walking if smoothed >= thresh else standing
+                        self._set_pred_text(
+                            f"{label} ({smoothed:.2f})",
+                            f"P({walking}) = {p:.2f} raw / {smoothed:.2f} smoothed"
+                            f"   ·   threshold {thresh:.2f}")
             except Exception as e:
                 print("Prediction error:", e)
-            time.sleep(1)
+            time.sleep(max(0.0, hop - (time.perf_counter() - tick)))
+
+        self._set_pred_text("Waiting...")
 
 if __name__ == "__main__":
     app = MainApp()

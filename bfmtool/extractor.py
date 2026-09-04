@@ -171,13 +171,19 @@ class BFMExtractor:
     Extracts Beamforming (BFM) reports from pcap files into a CSV format
     by efficiently calling the tshark command-line tool.
     """
-    def __init__(self, tshark_path: str, csv_dir : str):
+    def __init__(self, tshark_path: str, csv_dir : str, show_progress: bool = True):
         """
         Initializes the extractor.
 
         Args:
             tshark_path (str): The absolute path to the tshark executable.
                                Example: r"C:\Program Files\Wireshark\tshark.exe"
+            show_progress (bool): Draw the tqdm bar during extraction. Turning
+                               it off also skips the packet-counting pre-pass,
+                               which exists only to supply the bar's total and
+                               costs a whole extra tshark run over the file.
+                               Real-time callers should pass False; it roughly
+                               halves per-file extraction cost.
         """
         if not os.path.exists(tshark_path):
             raise FileNotFoundError(
@@ -186,6 +192,12 @@ class BFMExtractor:
         self.tshark_path = tshark_path
         self._extracted_files = set()
         self.csv_dir = Path(csv_dir)
+        self.show_progress = show_progress
+        # Per-directory AppArmor verdict, see _readable_path. Confinement is a
+        # property of the host policy and the directory, never of an individual
+        # file, so probing it once per file wasted two tshark launches (~600 ms)
+        # on every chunk of a real-time capture.
+        self._staging_verdict = {}
     
     def get_extracted_files(self):
         return self._extracted_files
@@ -231,9 +243,22 @@ class BFMExtractor:
                 capture_output=True, text=True
             )
 
-        probe = can_read(pcap_path)
-        if probe.returncode == 0:
+        parent = os.path.dirname(os.path.abspath(str(pcap_path)))
+        verdict = self._staging_verdict.get(parent)
+
+        if verdict == 'direct':
             return str(pcap_path), None
+        if verdict == 'unreadable':
+            # staging was already shown not to help for this directory
+            return str(pcap_path), None
+
+        if verdict is None:
+            probe = can_read(pcap_path)
+            if probe.returncode == 0:
+                self._staging_verdict[parent] = 'direct'
+                return str(pcap_path), None
+        else:
+            probe = None   # verdict == 'stage': confinement already established
 
         staging_dir = tempfile.mkdtemp(prefix='bfm_tshark_')
         staged = os.path.join(staging_dir, os.path.basename(str(pcap_path)))
@@ -244,13 +269,16 @@ class BFMExtractor:
             print(f"⚠️ Could not stage {pcap_path} for tshark: {e}")
             return str(pcap_path), None
 
-        if can_read(staged).returncode != 0:
+        # Only verify staging the first time; the answer holds for the directory.
+        if verdict is None and can_read(staged).returncode != 0:
             # Staging didn't help (e.g. TMPDIR also lives under $HOME, or the
             # file is genuinely unreadable). Fall back and let the normal path
             # surface tshark's own error.
             shutil.rmtree(staging_dir, ignore_errors=True)
+            self._staging_verdict[parent] = 'unreadable'
             print(f"⚠️ tshark cannot read {pcap_path}: {probe.stderr.strip()}")
             return str(pcap_path), None
+        self._staging_verdict[parent] = 'stage'
 
         print(f"[Extractor] tshark cannot read {pcap_path} directly "
               f"(AppArmor profile on tshark); using a staged copy.")
@@ -271,24 +299,29 @@ class BFMExtractor:
     def _pcap_to_csv(self, pcap_path: str, csv_path: str, source_path=None):
         display_filter = "wlan.fixed.category_code == 21"
         
-        # (The packet counting section remains the same as the previous correct version)
-        print(f"Pre-calculating packet count in {source_path or pcap_path}...")
-        count_command = [self.tshark_path, '-r', pcap_path, '-Y', display_filter]
-        total_packets = 0
-        try:
-            process = subprocess.Popen(count_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
-            total_packets = sum(1 for _ in process.stdout)
-            stderr_output = process.stderr.read()
-            if stderr_output:
-                print(f"Tshark counting error: {stderr_output.strip()}")
-        except FileNotFoundError:
-            print(f"Error: '{self.tshark_path}' not found.")
-            return
-        
-        if total_packets == 0:
-            print("No packets matching the filter were found. Aborting.")
-            return
-        print(f"Found {total_packets} packets to extract. Starting main extraction...")
+        # The pre-pass below exists ONLY to give tqdm a total, at the price of
+        # dissecting the whole file an extra time. With no progress bar to feed
+        # there is nothing to count for, so skip it: the extraction loop below
+        # already stops at end of stream and handles the empty case.
+        total_packets = None
+        if self.show_progress:
+            print(f"Pre-calculating packet count in {source_path or pcap_path}...")
+            count_command = [self.tshark_path, '-r', pcap_path, '-Y', display_filter]
+            total_packets = 0
+            try:
+                process = subprocess.Popen(count_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+                total_packets = sum(1 for _ in process.stdout)
+                stderr_output = process.stderr.read()
+                if stderr_output:
+                    print(f"Tshark counting error: {stderr_output.strip()}")
+            except FileNotFoundError:
+                print(f"Error: '{self.tshark_path}' not found.")
+                return
+
+            if total_packets == 0:
+                print("No packets matching the filter were found. Aborting.")
+                return
+            print(f"Found {total_packets} packets to extract. Starting main extraction...")
 
         command = [self.tshark_path, '-r', pcap_path, '-Y', display_filter, '-V']
         
@@ -302,7 +335,8 @@ class BFMExtractor:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, text=True, encoding='utf-8')
             packet_stream = self._packet_stream_parser(process.stdout)
 
-            for bfm_report in tqdm(packet_stream, total=total_packets, desc="Extracting BFM"):
+            for bfm_report in tqdm(packet_stream, total=total_packets, desc="Extracting BFM",
+                                   disable=not self.show_progress):
                 bfm_report = clean_from_ansi(bfm_report)
                 
                 # --- NEW: Unpack the tuple returned by the updated function ---
