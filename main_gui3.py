@@ -42,6 +42,29 @@ from functools import partial
 from collections import deque
 from pathlib import Path
 
+
+def _safe_filename_part(value):
+    """Return a trimmed, cross-platform-safe filename component."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", value.strip())
+
+
+def _session_name(subject, activity, description=""):
+    """Join the required session metadata and optional description."""
+    parts = [
+        _safe_filename_part(subject),
+        _safe_filename_part(activity),
+    ]
+    description = _safe_filename_part(description)
+    if description:
+        parts.append(description)
+    return "_".join(parts)
+
+
+def _bfm_csv_filename(data_format, subject, activity, description, timestamp):
+    """Build an mp/ri BFM filename using the session naming convention."""
+    session_name = _session_name(subject, activity, description)
+    return f"bfm_{data_format}_data_{session_name}_{timestamp}.csv"
+
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 DATA_DIR      = './data'
 PCAP_PATH     = './data/wifisignal.pcap'
@@ -250,9 +273,11 @@ class LiveDataCollector:
                 # Establish connection
                 self.bfm_collector.connect()
 
-                # The router has no RTC and stamps packets with its own
-                # drifting clock; session trimming below compares against it,
-                # so sync before any capture starts.
+                # The router stamps every captured packet with its own clock,
+                # and it has no RTC and no WAN uplink to sync against — left
+                # alone it drifts months away from this machine. The session
+                # window below is trimmed against those timestamps, so the two
+                # clocks must agree before any capture starts.
                 self.bfm_collector.sync_clock()
 
                 # Traffic generation — start an iperf3 SERVER on the router so
@@ -836,9 +861,6 @@ class MainApp(tk.Tk):
         self._stop_csi.set()
         self._stop_pcap_transfer_loop()
 
-        # Gate on bfm_is_setup, not bfm_collector: a collector from a failed
-        # preflight would take _toggle_bfm_setup() into its *setup* branch and
-        # reconnect on window close.
         if self.bfm_is_setup:
             self._toggle_bfm_setup()
         elif self.bfm_collector is not None:
@@ -938,11 +960,32 @@ class MainApp(tk.Tk):
         # mirrored onto the prediction tab by _build_prediction_ui
         self.bfm_setup_btn = _WidgetGroup(setup_btn)
 
-        ttk.Label(parent, text="Label for this session:").pack(anchor="w", pady=(10,0))
-        self.collect_label = ttk.Entry(parent)
-        self.collect_label.pack(fill="x", padx=10)
+        required_fields = ttk.Frame(parent)
+        required_fields.pack(fill="x", padx=10, pady=(10, 0))
+        required_fields.columnconfigure(0, weight=1)
+        required_fields.columnconfigure(1, weight=1)
 
-        ttk.Label(parent, text="Duration (seconds):").pack(anchor="w", pady=(10,0))
+        ttk.Label(required_fields, text="Subject (required):").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.collect_subject = ttk.Entry(required_fields)
+        self.collect_subject.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+
+        ttk.Label(required_fields, text="Activity (required):").grid(
+            row=0, column=1, sticky="w", padx=(6, 0)
+        )
+        self.collect_activity = ttk.Entry(required_fields)
+        self.collect_activity.grid(row=1, column=1, sticky="ew", padx=(6, 0))
+
+        ttk.Label(parent, text="Description (optional):").pack(
+            anchor="w", padx=10, pady=(10, 0)
+        )
+        self.collect_description = ttk.Entry(parent)
+        self.collect_description.pack(fill="x", padx=10)
+
+        ttk.Label(parent, text="Duration (seconds):").pack(
+            anchor="w", padx=10, pady=(10, 0)
+        )
         self.duration_entry = ttk.Entry(parent)
         self.duration_entry.insert(0, "120")
         self.duration_entry.pack(fill="x", padx=10)
@@ -1074,9 +1117,13 @@ class MainApp(tk.Tk):
                 csi_widget.pack(padx=10, pady=10, fill="x")
 
     def _on_collect(self):
-        lbl = self.collect_label.get().strip()
-        if not lbl:
-            messagebox.showerror("Input Error", "Please enter a label first.")
+        subject = self.collect_subject.get().strip()
+        activity = self.collect_activity.get().strip()
+        description = self.collect_description.get().strip()
+        if not subject or not activity:
+            messagebox.showerror(
+                "Input Error", "Please enter both a subject and an activity."
+            )
             return
 
         try:
@@ -1098,9 +1145,13 @@ class MainApp(tk.Tk):
             target_fn = self._do_bfm_collection 
         
         self.collect_btn.config(state="disabled")
-        threading.Thread(target=target_fn, args=(lbl, duration), daemon=True).start()
+        threading.Thread(
+            target=target_fn,
+            args=(subject, activity, description, duration),
+            daemon=True,
+        ).start()
 
-    def _do_bfm_collection(self, label, duration):
+    def _do_bfm_collection(self, subject, activity, description, duration):
         """
         Run a single labeled streaming session. The download/processing threads
         owned by LiveDataCollector pull pcaps off the router via SFTP into
@@ -1161,8 +1212,10 @@ class MainApp(tk.Tk):
                 # Plot + status refresh is driven by _streaming_tick on the main thread
                 time.sleep(0.2)
 
-            # The pipeline runs behind the clock, so hold until the window's
-            # last seconds land or the saved CSV stops short.
+            # The capture pipeline runs behind the clock, so the last seconds of
+            # the window are still being rotated/downloaded/parsed right now.
+            # Hold until they land, otherwise the saved CSV stops short of the
+            # requested duration.
             self.timer_label.config(text="Finishing capture…")
             self.bfm_collector.wait_for_capture_through(capture_start_ts + duration)
 
@@ -1173,14 +1226,16 @@ class MainApp(tk.Tk):
         finally:
             # Save two versions of the session from the in-RAM buffers: real/imag
             # ratios (before conversion) → bfm_real_imag_csv/, and magnitude/phase
-            # (after conversion) → bfm_mag_phase_csv/, sharing the same
-            # {label}_{timestamp} stem.
+            # (after conversion) → bfm_mag_phase_csv/, sharing the same session
+            # metadata and timestamp.
             if self.bfm_collector is not None:
                 df_real_imag = pd.DataFrame(list(self.bfm_collector.processed_buffer))
 
-                # Trim to the requested duration: continuous streaming leaves
-                # chunks from before the timer started, and the drain above
-                # waits past the end. Router timestamps, hence capture_start_ts.
+                # Trim to exactly the duration requested in the GUI. Streaming
+                # runs continuously across sessions, so the buffer can hold
+                # chunks captured just before the timer started, and the drain
+                # above deliberately waits past the end for in-flight data.
+                # Packet timestamps come from the router, hence capture_start_ts.
                 if (
                     not df_real_imag.empty
                     and capture_start_ts is not None
@@ -1214,34 +1269,41 @@ class MainApp(tk.Tk):
 
                 if not df_real_imag.empty:
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    fname = f"bfm_data_{label}_{ts}.csv"
+                    ri_name = _bfm_csv_filename(
+                        "ri", subject, activity, description, ts
+                    )
+                    mp_name = _bfm_csv_filename(
+                        "mp", subject, activity, description, ts
+                    )
 
                     # 1) Real/imag ratios → bfm_real_imag_csv/
-                    df_real_imag["label"] = label
+                    df_real_imag["label"] = activity
                     os.makedirs("bfm_real_imag_csv", exist_ok=True)
                     df_real_imag.to_csv(
-                        os.path.join("bfm_real_imag_csv", fname), index=False
+                        os.path.join("bfm_real_imag_csv", ri_name), index=False
                     )
 
                     # 2) Magnitude/phase → bfm_mag_phase_csv/
                     df_mag_phase = convert_real_imag_to_mag_phase(df_real_imag, [], [])
                     os.makedirs("bfm_mag_phase_csv", exist_ok=True)
                     if not df_mag_phase.empty:
-                        df_mag_phase["label"] = label
+                        df_mag_phase["label"] = activity
                         df_mag_phase.to_csv(
-                            os.path.join("bfm_mag_phase_csv", fname), index=False
+                            os.path.join("bfm_mag_phase_csv", mp_name), index=False
                         )
 
                     self.collect_msg.config(
                         text=(
                             f"Saved {len(df_real_imag)} BFM packets → "
-                            f"bfm_real_imag_csv/{fname} and bfm_mag_phase_csv/{fname}"
+                            f"bfm_real_imag_csv/{ri_name} and "
+                            f"bfm_mag_phase_csv/{mp_name}"
                         ),
                         foreground="green",
                     )
                     print(
                         f"[BFM] Saved {len(df_real_imag)} records to "
-                        f"bfm_real_imag_csv/{fname} and bfm_mag_phase_csv/{fname}"
+                        f"bfm_real_imag_csv/{ri_name} and "
+                        f"bfm_mag_phase_csv/{mp_name}"
                     )
                 else:
                     self.collect_msg.config(
@@ -1255,16 +1317,20 @@ class MainApp(tk.Tk):
             # clicked.
 
             # 2) Snapshot the new files into the canonical bfm_* directories
-            self._snapshot_session_to_bfm_dirs(label, snapshot_before)
+            self._snapshot_session_to_bfm_dirs(
+                subject, activity, description, snapshot_before
+            )
 
             self.progress["value"] = 0
             self.timer_label.config(text="Time Remaining: 0s")
             self.collect_btn.config(state="normal")
 
-    def _snapshot_session_to_bfm_dirs(self, label, snapshot_before):
+    def _snapshot_session_to_bfm_dirs(
+        self, subject, activity, description, snapshot_before
+    ):
         """
         Merge every file produced during this session into a single output per
-        directory, named `bfm_data_{label}_{timestamp}.{ext}` to match the
+        directory, named with the session metadata and timestamp to match the
         existing labeled-training corpus convention (one file per session).
 
         - PCAPs: concatenated with scapy (rdpcap + wrpcap) so the merged file
@@ -1272,7 +1338,9 @@ class MainApp(tk.Tk):
         - CSVs: concatenated with pandas (single header row, all rows below).
         """
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_basename = f"bfm_data_{label}_{ts}"
+        out_basename = (
+            f"bfm_data_{_session_name(subject, activity, description)}_{ts}"
+        )
 
         def _new_files(d, before_set):
             if not os.path.isdir(d):
@@ -1564,8 +1632,9 @@ class MainApp(tk.Tk):
             messagebox.showinfo("Preflight passed", report)
             return
 
-        # Let the download thread bring streaming up, then verify with
-        # `ps | grep tcpdump` and show the running command line.
+        # Give the download thread a few seconds to SSH in, start iperf3,
+        # and launch tcpdump, then verify with `ps | grep tcpdump` and surface
+        # the result so the user sees the exact running command line.
         threading.Thread(
             target=self._verify_tcpdump_after_setup,
             args=(report,),
@@ -1732,7 +1801,9 @@ class MainApp(tk.Tk):
             pass
         return ok, lines
 
-    def _do_csi_collection(self, label, duration, ip="0.0.0.0", port=12345):
+    def _do_csi_collection(
+        self, subject, activity, description, duration, ip="0.0.0.0", port=12345
+    ):
         import math
         import datetime
         import socket
@@ -1742,7 +1813,8 @@ class MainApp(tk.Tk):
         import numpy as np
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"esp32_csi_{label}_{timestamp}.csv"
+        session_name = _session_name(subject, activity, description)
+        fname = f"esp32_csi_{session_name}_{timestamp}.csv"
         path = os.path.join(DATA_DIR, fname)
         os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -1821,11 +1893,11 @@ class MainApp(tk.Tk):
         self.collect_btn.config(state="normal")
 
 
-    def _do_collection_wrapper(self, label, duration):
-        self._do_collection(label, duration)
+    def _do_collection_wrapper(self, subject, activity, description, duration):
+        self._do_collection(subject, activity, description, duration)
         self._stop_pcap_transfer_loop()
 
-    def _do_collection(self, label, duration):
+    def _do_collection(self, subject, activity, description, duration):
         start_ts = time.time()
         last_count = 0
         wifisignal_records = []
@@ -1851,12 +1923,13 @@ class MainApp(tk.Tk):
             os.makedirs(DATA_DIR)
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"wifisignal_data_{label}_{ts}.csv"
+        session_name = _session_name(subject, activity, description)
+        fname = f"wifisignal_data_{session_name}_{ts}.csv"
 
         if wifisignal_records:
             num_features = len(wifisignal_records[0])
             df = pd.DataFrame(wifisignal_records, columns=[f"pkt{i}" for i in range(num_features)])
-            df["label"] = label
+            df["label"] = activity
             df.to_csv(os.path.join(DATA_DIR, fname), index=False)
             saved = len(wifisignal_records)
         else:

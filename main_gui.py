@@ -7,6 +7,7 @@ import platform
 import socket
 import csv
 import datetime
+import re
 
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
@@ -36,6 +37,29 @@ from bfmtool.preprocessor import BFMPreprocessor
 from bfmtool.utils import append_mag_phase, get_bfm_columns
 
 from functools import partial
+
+
+def _safe_filename_part(value):
+    """Return a trimmed, cross-platform-safe filename component."""
+    return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", value.strip())
+
+
+def _session_name(subject, activity, description=""):
+    """Join the required session metadata and optional description."""
+    parts = [
+        _safe_filename_part(subject),
+        _safe_filename_part(activity),
+    ]
+    description = _safe_filename_part(description)
+    if description:
+        parts.append(description)
+    return "_".join(parts)
+
+
+def _bfm_csv_filename(data_format, subject, activity, description, timestamp):
+    """Build an mp/ri BFM filename using the session naming convention."""
+    session_name = _session_name(subject, activity, description)
+    return f"bfm_{data_format}_data_{session_name}_{timestamp}.csv"
 
 
 def convert_real_imag_to_mag_phase(df, mag_cols, phase_cols):
@@ -220,11 +244,32 @@ class MainApp(tk.Tk):
         self.bfm_setup_btn = ttk.Button(parent, text="Setup BFM", command=self._toggle_bfm_setup)
         self.bfm_setup_btn.pack(pady=5)
 
-        ttk.Label(parent, text="Label for this session:").pack(anchor="w", pady=(10,0))
-        self.collect_label = ttk.Entry(parent)
-        self.collect_label.pack(fill="x", padx=10)
+        required_fields = ttk.Frame(parent)
+        required_fields.pack(fill="x", padx=10, pady=(10, 0))
+        required_fields.columnconfigure(0, weight=1)
+        required_fields.columnconfigure(1, weight=1)
 
-        ttk.Label(parent, text="Duration (seconds):").pack(anchor="w", pady=(10,0))
+        ttk.Label(required_fields, text="Subject (required):").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.collect_subject = ttk.Entry(required_fields)
+        self.collect_subject.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+
+        ttk.Label(required_fields, text="Activity (required):").grid(
+            row=0, column=1, sticky="w", padx=(6, 0)
+        )
+        self.collect_activity = ttk.Entry(required_fields)
+        self.collect_activity.grid(row=1, column=1, sticky="ew", padx=(6, 0))
+
+        ttk.Label(parent, text="Description (optional):").pack(
+            anchor="w", padx=10, pady=(10, 0)
+        )
+        self.collect_description = ttk.Entry(parent)
+        self.collect_description.pack(fill="x", padx=10)
+
+        ttk.Label(parent, text="Duration (seconds):").pack(
+            anchor="w", padx=10, pady=(10, 0)
+        )
         self.duration_entry = ttk.Entry(parent)
         self.duration_entry.insert(0, "120")
         self.duration_entry.pack(fill="x", padx=10)
@@ -250,9 +295,13 @@ class MainApp(tk.Tk):
         self.csi_canvas.get_tk_widget().pack(padx=10, pady=10, fill="x")
 
     def _on_collect(self):
-        lbl = self.collect_label.get().strip()
-        if not lbl:
-            messagebox.showerror("Input Error", "Please enter a label first.")
+        subject = self.collect_subject.get().strip()
+        activity = self.collect_activity.get().strip()
+        description = self.collect_description.get().strip()
+        if not subject or not activity:
+            messagebox.showerror(
+                "Input Error", "Please enter both a subject and an activity."
+            )
             return
 
         try:
@@ -274,9 +323,13 @@ class MainApp(tk.Tk):
             target_fn = self._do_bfm_collection 
         
         self.collect_btn.config(state="disabled")
-        threading.Thread(target=target_fn, args=(lbl, duration), daemon=True).start()
+        threading.Thread(
+            target=target_fn,
+            args=(subject, activity, description, duration),
+            daemon=True,
+        ).start()
 
-    def _do_bfm_collection(self, label, duration):
+    def _do_bfm_collection(self, subject, activity, description, duration):
         # --- Component 1: Initialization ---
         start_ts = None
         capture_start_ts = None
@@ -286,7 +339,9 @@ class MainApp(tk.Tk):
             # collector thread, otherwise any file it downloads before this
             # line runs gets saved under the default 'bfm' filename instead
             # of the labeled one.
-            self.bfm_collector.filename = partial(self.generate_bfm_filename, label)
+            self.bfm_collector.filename = partial(
+                self.generate_bfm_filename, subject, activity, description
+            )
             self.bfm_collector.run_tcpdump()
             start_ts = time.time()
 
@@ -406,17 +461,23 @@ class MainApp(tk.Tk):
                             print(f"[BFM ERROR] Preprocessing failed: {e}")
 
                         try:
-                            out_name, rows = self._merge_bfm_session_csv(
-                                label, to_be_processed, capture_start_ts, duration
+                            output_names, rows = self._merge_bfm_session_csv(
+                                subject,
+                                activity,
+                                description,
+                                to_be_processed,
+                                capture_start_ts,
+                                duration,
                             )
                         except Exception as e:
                             print(f"[BFM ERROR] Merging session CSV failed: {e}")
-                            out_name, rows = None, 0
+                            output_names, rows = None, 0
 
-                        if out_name:
+                        if output_names:
+                            ri_name, mp_name = output_names
                             status_text, status_color = (
-                                f"[BFM] Saved {rows} rows → bfm_real_imag_csv/{out_name} "
-                                f"and bfm_mag_phase_csv/{out_name}",
+                                f"[BFM] Saved {rows} rows → bfm_real_imag_csv/{ri_name} "
+                                f"and bfm_mag_phase_csv/{mp_name}",
                                 "green",
                             )
                         else:
@@ -432,15 +493,22 @@ class MainApp(tk.Tk):
             self.collect_msg.config(text=status_text, foreground=status_color)
             print(status_text)
 
-    def _merge_bfm_session_csv(self, label, raw_csv_paths, start_ts=None, duration=None):
+    def _merge_bfm_session_csv(
+        self,
+        subject,
+        activity,
+        description,
+        raw_csv_paths,
+        start_ts=None,
+        duration=None,
+    ):
         """
         Merge this session's per-chunk processed CSVs (one per pcap rotation
         chunk, written by BFMPreprocessor into bfm_processed_csv/ under the
         same basename as their raw/pcap source) into a single
-        bfm_data_{label}_{timestamp}.csv, matching the one-file-per-session
-        convention the training notebooks expect. Two versions are written:
+        one file per session. Two versions are written:
         the real/imag ratios into bfm_real_imag_csv/ and the magnitude/phase
-        conversion into bfm_mag_phase_csv/ (same {label}_{timestamp} stem). The
+        conversion into bfm_mag_phase_csv/. The
         per-chunk fragments are removed afterward so bfm_processed_csv doesn't
         accumulate duplicates.
 
@@ -451,7 +519,8 @@ class MainApp(tk.Tk):
         [start_ts, start_ts + duration] using the 'timestamp' column
         (epoch seconds) so the saved CSV covers exactly what was requested.
 
-        Returns (output_filename, row_count) or (None, 0) if nothing could be merged.
+        Returns ((real_imag_filename, mag_phase_filename), row_count), or
+        (None, 0) if nothing could be merged.
         """
         processed_dir = self.bfm_preprocessor.dir
         processed_paths = [
@@ -493,23 +562,28 @@ class MainApp(tk.Tk):
             else:
                 merged = trimmed
 
-        merged["label"] = label
+        merged["label"] = activity
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_name = f"bfm_data_{label}_{ts}.csv"
+        ri_name = _bfm_csv_filename(
+            "ri", subject, activity, description, ts
+        )
+        mp_name = _bfm_csv_filename(
+            "mp", subject, activity, description, ts
+        )
 
         # 1) Real/imag ratios (before conversion) → bfm_real_imag_csv/
         real_imag_dir = "bfm_real_imag_csv"
         os.makedirs(real_imag_dir, exist_ok=True)
-        merged.to_csv(os.path.join(real_imag_dir, out_name), index=False)
+        merged.to_csv(os.path.join(real_imag_dir, ri_name), index=False)
 
         # 2) Magnitude/phase (after conversion) → bfm_mag_phase_csv/
         mag_phase_dir = "bfm_mag_phase_csv"
         os.makedirs(mag_phase_dir, exist_ok=True)
         mag_phase = convert_real_imag_to_mag_phase(merged, [], [])
         if not mag_phase.empty:
-            mag_phase["label"] = label
-            mag_phase.to_csv(os.path.join(mag_phase_dir, out_name), index=False)
+            mag_phase["label"] = activity
+            mag_phase.to_csv(os.path.join(mag_phase_dir, mp_name), index=False)
 
         # Remove the per-chunk fragments so bfm_processed_csv/ stays clean
         for p in processed_paths:
@@ -518,7 +592,7 @@ class MainApp(tk.Tk):
             except OSError:
                 pass
 
-        return out_name, len(merged)
+        return (ri_name, mp_name), len(merged)
 
     def _toggle_bfm_setup(self):
         """
@@ -599,7 +673,9 @@ class MainApp(tk.Tk):
                 self.bfm_setup_btn.config(text="Setup BFM")
                 self.collect_msg.config(text="BFM connection closed.", foreground="black")
 
-    def _do_csi_collection(self, label, duration, ip="0.0.0.0", port=12345):
+    def _do_csi_collection(
+        self, subject, activity, description, duration, ip="0.0.0.0", port=12345
+    ):
         import math
         import datetime
         import socket
@@ -609,7 +685,8 @@ class MainApp(tk.Tk):
         import numpy as np
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"esp32_csi_{label}_{timestamp}.csv"
+        session_name = _session_name(subject, activity, description)
+        fname = f"esp32_csi_{session_name}_{timestamp}.csv"
         path = os.path.join(DATA_DIR, fname)
         os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -688,11 +765,11 @@ class MainApp(tk.Tk):
         self.collect_btn.config(state="normal")
 
 
-    def _do_collection_wrapper(self, label, duration):
-        self._do_collection(label, duration)
+    def _do_collection_wrapper(self, subject, activity, description, duration):
+        self._do_collection(subject, activity, description, duration)
         self._stop_pcap_transfer_loop()
 
-    def _do_collection(self, label, duration):
+    def _do_collection(self, subject, activity, description, duration):
         start_ts = time.time()
         last_count = 0
         wifisignal_records = []
@@ -718,12 +795,13 @@ class MainApp(tk.Tk):
             os.makedirs(DATA_DIR)
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"wifisignal_data_{label}_{ts}.csv"
+        session_name = _session_name(subject, activity, description)
+        fname = f"wifisignal_data_{session_name}_{ts}.csv"
 
         if wifisignal_records:
             num_features = len(wifisignal_records[0])
             df = pd.DataFrame(wifisignal_records, columns=[f"pkt{i}" for i in range(num_features)])
-            df["label"] = label
+            df["label"] = activity
             df.to_csv(os.path.join(DATA_DIR, fname), index=False)
             saved = len(wifisignal_records)
         else:
@@ -747,10 +825,10 @@ class MainApp(tk.Tk):
             print("Failed to parse wifisignal:", e)
             return None
         
-    def generate_bfm_filename(self, label):
+    def generate_bfm_filename(self, subject, activity, description):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        return f"bfm_data_{label}_{timestamp}.pcap"
+        return f"bfm_data_{_session_name(subject, activity, description)}_{timestamp}.pcap"
 
     def _extract_bfm_for_plot(self, pcap_file):
         """
