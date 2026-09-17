@@ -1277,7 +1277,8 @@ class MainApp(tk.Tk):
                     )
 
                     # 1) Real/imag ratios → bfm_real_imag_csv/
-                    df_real_imag["label"] = activity
+                    df_real_imag["subject"] = subject
+                    df_real_imag["activity"] = activity
                     os.makedirs("bfm_real_imag_csv", exist_ok=True)
                     df_real_imag.to_csv(
                         os.path.join("bfm_real_imag_csv", ri_name), index=False
@@ -1287,7 +1288,8 @@ class MainApp(tk.Tk):
                     df_mag_phase = convert_real_imag_to_mag_phase(df_real_imag, [], [])
                     os.makedirs("bfm_mag_phase_csv", exist_ok=True)
                     if not df_mag_phase.empty:
-                        df_mag_phase["label"] = activity
+                        df_mag_phase["subject"] = subject
+                        df_mag_phase["activity"] = activity
                         df_mag_phase.to_csv(
                             os.path.join("bfm_mag_phase_csv", mp_name), index=False
                         )

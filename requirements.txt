@@ -23,3 +23,6 @@ tqdm>=4.65.0
 # Optional: For original TensorFlow notebooks
 # tensorflow-macos>=2.13.0
 # tensorflow-metal>=1.0.0
+
+# Testing (see CLAUDE.md "Tests")
+pytest>=8.0

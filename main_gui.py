@@ -562,7 +562,8 @@ class MainApp(tk.Tk):
             else:
                 merged = trimmed
 
-        merged["label"] = activity
+        merged["subject"] = subject
+        merged["activity"] = activity
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         ri_name = _bfm_csv_filename(
@@ -582,7 +583,8 @@ class MainApp(tk.Tk):
         os.makedirs(mag_phase_dir, exist_ok=True)
         mag_phase = convert_real_imag_to_mag_phase(merged, [], [])
         if not mag_phase.empty:
-            mag_phase["label"] = activity
+            mag_phase["subject"] = subject
+            mag_phase["activity"] = activity
             mag_phase.to_csv(os.path.join(mag_phase_dir, mp_name), index=False)
 
         # Remove the per-chunk fragments so bfm_processed_csv/ stays clean
