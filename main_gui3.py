@@ -77,7 +77,8 @@ WINDOW_SIZE   = 5
 RETRY_INTERVAL = 2.0
 
 # Real-time BFM standing/walking detector configuration
-BFM_MODEL_PATHS = ['bfm_rt_model_nofoil_xgb.joblib', 'bfm_rt_model_nofoil.joblib']
+# First existing bundle wins; the 5 s model comes from train_rt_bfm.py.
+BFM_MODEL_PATHS = ['bfm_rt_model_5s_xgb.joblib', 'bfm_rt_model_nofoil_xgb.joblib', 'bfm_rt_model_nofoil.joblib']
 BFM_RT_MAX_GAP  = 0.15   # reject a window if >15% of its grid ticks had no packet nearby
 BFM_RT_EMA      = 0.5    # causal EMA over the probability stream
 BFM_RT_STALE_S  = 5.0    # no new packet processed for this long -> report no live data
