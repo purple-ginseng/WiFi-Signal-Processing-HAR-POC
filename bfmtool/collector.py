@@ -21,7 +21,8 @@ class BFMCollector:
             local_pcap_dir="bfm_pcap", 
             filename='bfm', 
             filesize=5,
-            filecount=2
+            filecount=2,
+            verbose=True,
         ):
         """
         Initializes the collector with connection details.
@@ -35,6 +36,8 @@ class BFMCollector:
             filename (str | Callable, optional): Base filename (or callable returning one).
             filesize (int, optional): Maximum size in MB before tcpdump rotates files.
             filecount (int, optional): Number of rotating capture files to keep on the router.
+            verbose (bool, optional): Echo every SSH command run. Real-time callers
+                               pass False; their health check polls every second.
         """
         self.host = host
         self.username = username
@@ -47,6 +50,7 @@ class BFMCollector:
         self.filecounter = -1
         self.local_pcap_dir = local_pcap_dir
         self.filecount = max(1, int(filecount))
+        self.verbose = verbose
         self.pcap_collector_thread = None
         self._stop_event = threading.Event()
         self._processed_files = set() 
@@ -121,7 +125,8 @@ class BFMCollector:
             print("❌ Cannot run command. Client is not connected.")
             return None, None
 
-        print(f"Executing command: '{command}'")
+        if self.verbose:
+            print(f"Executing command: '{command}'")
         stdin, stdout, stderr = self.client.exec_command(command)
 
         # Read the output and error streams and decode them from bytes to string

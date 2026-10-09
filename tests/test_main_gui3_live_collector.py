@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 import main_gui3
-from conftest import SAMPLE_PCAP, make_packet_rows, make_ratio_frame, run_until
+from conftest import SAMPLE_PCAP, make_packet_frame, make_ratio_frame, run_until
 
 pytestmark = pytest.mark.skipif(
     not os.path.exists(main_gui3.TSHARK_PATH),
@@ -47,37 +47,38 @@ def test_latest_processed_timestamp_empty(collector):
 
 
 def test_latest_processed_timestamp_is_max_and_skips_bad(collector):
-    collector.processed_buffer.extend([
-        {"timestamp": 10.0}, {"timestamp": "12.5"}, {"timestamp": None},
-        {"timestamp": "nan?"}, {"timestamp": 11.0},
-    ])
+    collector.processed_buffer.append(
+        pd.DataFrame({"timestamp": [10.0, "12.5", None, "nan?", 11.0]})
+    )
     assert collector.latest_processed_timestamp() == 12.5
 
 
 def test_latest_processed_timestamp_only_looks_at_tail(collector):
-    collector.processed_buffer.extend({"timestamp": 999.0} for _ in range(3))
-    collector.processed_buffer.extend({"timestamp": 1.0} for _ in range(64))
+    collector.processed_buffer.append(pd.DataFrame({"timestamp": [999.0] * 3}))
+    collector.processed_buffer.append(pd.DataFrame({"timestamp": [1.0] * 64}))
     assert collector.latest_processed_timestamp() == 1.0
 
 
 def test_get_latest_packets_requires_n(collector):
-    collector.packet_buffer.extend(make_packet_rows(3))
+    collector.packet_buffer.append(make_packet_frame(3))
     assert collector.get_latest_packets(5) is None
     assert collector.get_latest_processed(1) is None
 
 
 def test_get_latest_packets_returns_tail(collector):
-    rows = make_packet_rows(10)
-    collector.packet_buffer.extend(rows)
+    frame = make_packet_frame(10)
+    collector.packet_buffer.append(frame.iloc[:7])
+    collector.packet_buffer.append(frame.iloc[7:])   # tail spans two chunks
     df = collector.get_latest_packets(4)
     assert isinstance(df, pd.DataFrame)
     assert len(df) == 4
-    assert df["timestamp"].tolist() == [r["timestamp"] for r in rows[-4:]]
+    assert df["timestamp"].tolist() == frame["timestamp"].iloc[-4:].tolist()
+    assert df.index.tolist() == [0, 1, 2, 3]
 
 
 def test_get_latest_processed_returns_tail(collector):
     frame = make_ratio_frame(6)
-    collector.processed_buffer.extend(frame.to_dict("records"))
+    collector.processed_buffer.append(frame)
     df = collector.get_latest_processed(2)
     assert len(df) == 2
     assert df["timestamp"].iloc[-1] == frame["timestamp"].iloc[-1]
@@ -101,21 +102,21 @@ def test_clock_offset_delegates_and_swallows_errors(collector):
 
 
 def test_wait_for_capture_through_already_covered(collector):
-    collector.processed_buffer.append({"timestamp": 100.0})
+    collector.processed_buffer.append(pd.DataFrame({"timestamp": [100.0]}))
     t = time.time()
     assert collector.wait_for_capture_through(99.0, timeout=5.0) is True
     assert time.time() - t < 1.0
 
 
 def test_wait_for_capture_through_times_out(collector):
-    collector.processed_buffer.append({"timestamp": 100.0})
+    collector.processed_buffer.append(pd.DataFrame({"timestamp": [100.0]}))
     assert collector.wait_for_capture_through(101.0, timeout=0.5) is False
 
 
 def test_wait_for_capture_through_unblocks_when_tail_lands(collector):
     def feed():
         time.sleep(0.3)
-        collector.processed_buffer.append({"timestamp": 200.0})
+        collector.processed_buffer.append(pd.DataFrame({"timestamp": [200.0]}))
     threading.Thread(target=feed, daemon=True).start()
     assert collector.wait_for_capture_through(200.0, timeout=5.0) is True
 
@@ -169,19 +170,45 @@ def test_processing_loop_fills_buffers_from_real_pcap(collector, tmp_path):
     assert len(collector.packet_buffer) == 11
     assert len(collector.processed_buffer) == 11
 
-    row = collector.packet_buffer[-1]
+    row = collector.packet_buffer.tail(1).iloc[0].to_dict()
     assert "pc_timestamp" in row and abs(row["pc_timestamp"] - time.time()) < 60
     mags = [k for k in row if k.endswith("_Ratio_Mag")]
     phases = [k for k in row if k.endswith("_Ratio_Phase")]
     assert len(mags) == len(phases) > 0
     assert np.isfinite([row[k] for k in mags]).all()
 
-    proc = collector.processed_buffer[-1]
+    proc = collector.processed_buffer.tail(1).iloc[0].to_dict()
     assert any(k.endswith("_Ratio_Real") for k in proc)
     assert float(proc["timestamp"]) > 1e9
 
     assert (tmp_path / "live_bfm_raw_csv" / "live_bfm0.csv").is_file()
     assert (tmp_path / "live_bfm_processed_csv" / "live_bfm0.csv").is_file()
+
+
+@pytest.mark.tshark
+def test_processing_loop_is_quiet_by_default(collector, tmp_path, capsys):
+    # Per-chunk chatter floods the terminal over hours of streaming.
+    assert main_gui3.BFM_VERBOSE is False
+    local = tmp_path / "live_bfm_pcap" / "live_bfm0.pcap"
+    shutil.copy(SAMPLE_PCAP, local)
+    collector.download_queue.append(str(local))
+
+    _run_processing(collector)
+
+    assert collector.total_packets == 11
+    out = capsys.readouterr().out
+    for chatter in ("✓ +11 packets", "[Processing] live_bfm0.pcap",
+                    "Creating DataFrame", "BFM data saved", "Original data shape",
+                    "subcarriers."):
+        assert chatter not in out
+
+
+def test_vprint_follows_verbose_flag(collector, monkeypatch, capsys):
+    collector._vprint("[Download] routine")
+    assert capsys.readouterr().out == ""
+    monkeypatch.setattr(main_gui3, "BFM_VERBOSE", True)
+    collector._vprint("[Download] routine")
+    assert "[Download] routine" in capsys.readouterr().out
 
 
 @pytest.mark.tshark

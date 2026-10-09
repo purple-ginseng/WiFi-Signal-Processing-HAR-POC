@@ -57,6 +57,11 @@ def make_packet_rows(n_rows=40, scidx=DEFAULT_SCIDX, t0=1_700_000_000.0, fs=10.0
     return rows
 
 
+def make_packet_frame(*args, **kwargs):
+    """make_packet_rows() as one chunk frame, as LiveDataCollector buffers it."""
+    return pd.DataFrame(make_packet_rows(*args, **kwargs))
+
+
 # ─── Fakes ─────────────────────────────────────────────────────────────────────
 class FakeCollector:
     """Stand-in for LiveDataCollector with the attributes the GUI reads."""
@@ -65,8 +70,9 @@ class FakeCollector:
         self.running = running
         self.connected = connected
         self.connection_status = status
-        self.packet_buffer = deque(maxlen=10000)
-        self.processed_buffer = deque(maxlen=10000)
+        from main_gui3 import FrameBuffer
+        self.packet_buffer = FrameBuffer(10000)
+        self.processed_buffer = FrameBuffer(10000)
         self.total_downloaded = 0
         self.total_processed = 0
         self.total_packets = 0

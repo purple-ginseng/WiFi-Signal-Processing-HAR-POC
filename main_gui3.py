@@ -21,9 +21,7 @@ from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import confusion_matrix, classification_report
 
-import tensorflow as tf
-from tensorflow.keras import layers, models, callbacks
-from tensorflow.keras.models import load_model
+# TensorFlow (~420 MB) is imported lazily, only by the legacy CNN tabs.
 
 import matplotlib
 matplotlib.use("TkAgg")
@@ -75,6 +73,8 @@ BATCH_SIZE_TF = 32
 BUFFER_SIZE   = 10000
 WINDOW_SIZE   = 5
 RETRY_INTERVAL = 2.0
+# Per-poll status prints flood the terminal; capture events still reach DEBUG_LOG.
+BFM_VERBOSE   = False
 
 # Real-time BFM standing/walking detector configuration
 # First existing bundle wins; the 5 s model comes from train_rt_bfm.py.
@@ -130,6 +130,69 @@ def convert_real_imag_to_mag_phase(df, mag_cols, phase_cols):
 
 
 # ───────────────────────────────────────────────────────────────────────────────
+class FrameBuffer:
+    """Row-capped FIFO of per-chunk DataFrames, oldest rows dropped first.
+
+    One dict per packet cost ~60 KiB/row per buffer; chunk frames ~7 KiB/row.
+    Thread-safe: the processing thread appends while the GUI thread reads.
+    """
+
+    def __init__(self, maxrows):
+        self.maxrows = maxrows
+        self._frames = deque()
+        self._rows = 0
+        self._lock = threading.Lock()
+        # Bumped on every append/clear so readers can skip unchanged data.
+        self.generation = 0
+
+    def __len__(self):
+        return self._rows
+
+    def append(self, df):
+        if df is None or df.empty:
+            return
+        # pandas 3 read_csv keeps one block per column (~35 KiB/row); copy() consolidates.
+        df = df.copy()
+        with self._lock:
+            if self._frames and df.columns.equals(self._frames[-1].columns):
+                # Sharing one column Index halves what's left (measured 10.6 -> 5.3 KiB/row).
+                df.columns = self._frames[-1].columns
+            self._frames.append(df)
+            self._rows += len(df)
+            while self._rows > self.maxrows:
+                excess = self._rows - self.maxrows
+                oldest = self._frames[0]
+                if len(oldest) <= excess:
+                    self._frames.popleft()
+                    self._rows -= len(oldest)
+                else:
+                    self._frames[0] = oldest.iloc[excess:]
+                    self._rows -= excess
+            self.generation += 1
+
+    def clear(self):
+        with self._lock:
+            self._frames.clear()
+            self._rows = 0
+            self.generation += 1
+
+    def tail(self, n=None):
+        """Newest n rows (all rows if n is None) as one DataFrame with a fresh index."""
+        with self._lock:
+            frames, total = [], 0
+            for df in reversed(self._frames):
+                if n is not None and total >= n:
+                    break
+                frames.append(df)
+                total += len(df)
+        if not frames:
+            return pd.DataFrame()
+        out = pd.concat(frames[::-1], ignore_index=True)
+        if n is not None and len(out) > n:
+            out = out.iloc[-n:].reset_index(drop=True)
+        return out
+
+
 class LiveDataCollector:
     """
     Collects pcap data from router in real-time using BFMCollector.
@@ -151,8 +214,8 @@ class LiveDataCollector:
 
         # Dual-queue architecture for parallel download + processing
         self.download_queue = deque(maxlen=1000)  # Queue of pcap files to process
-        self.packet_buffer = deque(maxlen=BUFFER_SIZE)  # Mag/phase features
-        self.processed_buffer = deque(maxlen=BUFFER_SIZE)  # Ratio_Real/Imag for Doppler
+        self.packet_buffer = FrameBuffer(BUFFER_SIZE)  # Mag/phase features
+        self.processed_buffer = FrameBuffer(BUFFER_SIZE)  # Ratio_Real/Imag for Doppler
 
         # Separate threads
         self.download_thread = None
@@ -202,9 +265,12 @@ class LiveDataCollector:
         # show_progress=False skips the packet-counting pre-pass, halving the
         # per-chunk extraction cost.
         self.bfm_extractor = BFMExtractor(
-            tshark_path=TSHARK_PATH, csv_dir="live_bfm_raw_csv", show_progress=False
+            tshark_path=TSHARK_PATH, csv_dir="live_bfm_raw_csv", show_progress=False,
+            verbose=BFM_VERBOSE,
         )
-        self.bfm_preprocessor = BFMPreprocessor(dir="live_bfm_processed_csv")
+        self.bfm_preprocessor = BFMPreprocessor(
+            dir="live_bfm_processed_csv", verbose=BFM_VERBOSE
+        )
 
     DEBUG_LOG = "live_bfm_debug.log"
 
@@ -220,6 +286,11 @@ class LiveDataCollector:
                 fh.write(line + "\n")
         except OSError:
             pass
+
+    def _vprint(self, *args, **kwargs):
+        """Print routine per-poll status only when BFM_VERBOSE is on."""
+        if BFM_VERBOSE:
+            print(*args, **kwargs)
 
     def _launch_tcpdump_explicit(self, verify=True):
         """
@@ -269,6 +340,7 @@ class LiveDataCollector:
                     filename="live_bfm",
                     filesize=1,
                     filecount=10,
+                    verbose=BFM_VERBOSE,
                 )
 
                 # Establish connection
@@ -385,15 +457,11 @@ class LiveDataCollector:
 
     def latest_processed_timestamp(self):
         """Newest router-clock timestamp currently in processed_buffer."""
-        newest = None
-        for row in list(self.processed_buffer)[-64:]:
-            try:
-                value = float(row.get("timestamp"))
-            except (TypeError, ValueError):
-                continue
-            if newest is None or value > newest:
-                newest = value
-        return newest
+        tail = self.processed_buffer.tail(64)
+        if "timestamp" not in tail:
+            return None
+        newest = pd.to_numeric(tail["timestamp"], errors="coerce").max()
+        return None if pd.isna(newest) else float(newest)
 
     def wait_for_capture_through(self, target_ts, timeout=25.0):
         """Block until extracted data reaching target_ts has landed in the buffer.
@@ -449,7 +517,7 @@ class LiveDataCollector:
                             "pgrep -f 'tcpdump -i mon0 -p -U -B 4096 -G 1'"
                         )
                         if output:
-                            print(
+                            self._vprint(
                                 f"[Download] tcpdump health check OK (PID: {output.strip()})"
                             )
                         else:
@@ -487,14 +555,14 @@ class LiveDataCollector:
                         self._log(
                             "[NO-FILES] no bfm_capture* on router (skips liveness update)"
                         )
-                        print(f"[Download] Files in /tmp/ (sample): {tmp_files_sample}")
+                        self._vprint(f"[Download] Files in /tmp/ (sample): {tmp_files_sample}")
                         processed_files.clear()
                         single_file_tracker.clear()
                         time.sleep(0.1)
                         sftp.close()
                         continue
 
-                    print(f"[Download] Found {len(pcap_files)} file(s): {pcap_files}")
+                    self._vprint(f"[Download] Found {len(pcap_files)} file(s): {pcap_files}")
                     file_stats = []
                     for filename in pcap_files:
                         remote_path = f"/tmp/{filename}"
@@ -535,7 +603,7 @@ class LiveDataCollector:
                             % (len(file_stats) - self.MAX_REMOTE_CHUNKS)
                         )
                         file_stats = file_stats[-self.MAX_REMOTE_CHUNKS :]
-                    print(
+                    self._vprint(
                         f"[Download] File stats: {[(f['path'].split('/')[-1], f['size'], 'bytes') for f in file_stats]}"
                     )
 
@@ -564,7 +632,7 @@ class LiveDataCollector:
                     candidates = []
 
                     if len(file_stats) >= 2:
-                        print(
+                        self._vprint(
                             f"[Download] Multiple files detected, downloading all except newest"
                         )
                         candidates = file_stats[
@@ -582,7 +650,7 @@ class LiveDataCollector:
                             and tracker["size"] == sole["size"]
                         ):
                             tracker["stable_checks"] += 1
-                            print(
+                            self._vprint(
                                 f"[Download] Single file {sole['path'].split('/')[-1]} stable check {tracker['stable_checks']}/2"
                             )
                         else:
@@ -592,22 +660,22 @@ class LiveDataCollector:
                                 "stable_checks": 1,
                             }
                             tracker = single_file_tracker[sole["path"]]
-                            print(
+                            self._vprint(
                                 f"[Download] Single file {sole['path'].split('/')[-1]} tracking started (size: {sole['size']} bytes)"
                             )
 
                         # 1 check: download immediately if non-empty (highest sensitivity)
                         if tracker["stable_checks"] >= 1 and tracker["size"] > 100:
-                            print(
+                            self._vprint(
                                 f"[Download] Single file {sole['path'].split('/')[-1]} is stable, adding to candidates"
                             )
                             candidates.append(sole)
                         else:
-                            print(
+                            self._vprint(
                                 f"[Download] Single file {sole['path'].split('/')[-1]} not yet stable ({tracker['stable_checks']}/1 checks, size {sole['size']}B)"
                             )
 
-                    print(f"[Download] Candidates for download: {len(candidates)}")
+                    self._vprint(f"[Download] Candidates for download: {len(candidates)}")
                     now_processed = []
 
                     for entry in candidates:
@@ -615,19 +683,19 @@ class LiveDataCollector:
                         size_bytes = entry["size"]
 
                         if size_bytes < 100:
-                            print(
+                            self._vprint(
                                 f"[Download] Skipping {remote_path.split('/')[-1]} - too small ({size_bytes} bytes)"
                             )
                             continue
 
                         last_mtime = processed_files.get(remote_path)
                         if last_mtime == entry["mtime"]:
-                            print(
+                            self._vprint(
                                 f"[Download] Skipping {remote_path.split('/')[-1]} - already processed (mtime: {entry['mtime']})"
                             )
                             continue
 
-                        print(
+                        self._vprint(
                             f"[Download] Processing candidate {remote_path.split('/')[-1]} ({size_bytes} bytes)"
                         )
 
@@ -654,7 +722,7 @@ class LiveDataCollector:
 
                             # Add to processing queue
                             self.download_queue.append(str(local_path))
-                            print(
+                            self._vprint(
                                 f"[Download] Queued {local_filename} ({size_bytes} bytes, queue: {len(self.download_queue)})"
                             )
                         except Exception as e:
@@ -711,7 +779,7 @@ class LiveDataCollector:
                 if not pcap_path.exists():
                     continue
 
-                print(f"[Processing] {pcap_path.name}...")
+                self._vprint(f"[Processing] {pcap_path.name}...")
                 self.total_processed += 1
 
                 # Step 1: Extract BFM data (phi/psi angles) - FAST: skip if empty
@@ -755,20 +823,15 @@ class LiveDataCollector:
                 if df_mag_phase.empty:
                     continue
 
-                # Add packets to buffers
+                # Add the chunk to both buffers as whole frames
                 num_packets = len(df_mag_phase)
-                pc_now = time.time()
-                for idx, row in df_mag_phase.iterrows():
-                    row_dict = row.to_dict()
-                    row_dict["pc_timestamp"] = pc_now
-                    self.packet_buffer.append(row_dict)
+                self.packet_buffer.append(df_mag_phase.assign(pc_timestamp=time.time()))
 
                 # Also keep processed data for Doppler analysis
-                for idx, row in df_processed.iterrows():
-                    self.processed_buffer.append(row.to_dict())
+                self.processed_buffer.append(df_processed)
 
                 self.total_packets += num_packets
-                print(
+                self._vprint(
                     f"[Processing] ✓ +{num_packets} packets (buffer: {len(self.packet_buffer)}, total: {self.total_packets})"
                 )
 
@@ -783,19 +846,13 @@ class LiveDataCollector:
         """Get the latest N mag/phase packets from buffer"""
         if len(self.packet_buffer) < n:
             return None
-
-        # Get last n packets
-        packets = list(self.packet_buffer)[-n:]
-        return pd.DataFrame(packets)
+        return self.packet_buffer.tail(n)
 
     def get_latest_processed(self, n=WINDOW_SIZE):
         """Get the latest N processed packets (Ratio_Real/Imag) from buffer"""
         if len(self.processed_buffer) < n:
             return None
-
-        # Get last n packets
-        packets = list(self.processed_buffer)[-n:]
-        return pd.DataFrame(packets)
+        return self.processed_buffer.tail(n)
 
     def get_buffer_size(self):
         """Get current buffer size"""
@@ -876,6 +933,7 @@ class MainApp(tk.Tk):
 
     def _load_trained_model(self):
         try:
+            from tensorflow.keras.models import load_model
             self.model = load_model("best_model.keras")
             self.pca = joblib.load("pca_tf.pkl")
             self.label_encoder = joblib.load("label_encoder_tf.pkl")
@@ -1060,6 +1118,8 @@ class MainApp(tk.Tk):
         self.bfm_doppler_canvas = FigureCanvasTkAgg(self.bfm_doppler_fig, master=parent)
         self.bfm_doppler_canvas.get_tk_widget().pack(padx=10, pady=10, fill="both", expand=True)
         self.WALK_THRESHOLD = 0.1  # rad/packet — same default as the Streamlit page
+        self._doppler_artists = None  # built on first data by _init_doppler_artists
+        self._doppler_drawn = None  # (buffer, generation) last drawn; unchanged means skip
 
         # Current Doppler features panel (mean / max / std / energy)
         self.bfm_feat_frame = ttk.LabelFrame(parent, text="Current Doppler Features", padding=8)
@@ -1230,7 +1290,7 @@ class MainApp(tk.Tk):
             # (after conversion) → bfm_mag_phase_csv/, sharing the same session
             # metadata and timestamp.
             if self.bfm_collector is not None:
-                df_real_imag = pd.DataFrame(list(self.bfm_collector.processed_buffer))
+                df_real_imag = self.bfm_collector.processed_buffer.tail()
 
                 # Trim to exactly the duration requested in the GUI. Streaming
                 # runs continuously across sessions, so the buffer can hold
@@ -1443,6 +1503,29 @@ class MainApp(tk.Tk):
         self.buf_var.set(f"Buffer: {len(c.packet_buffer)}")
         self.pkts_var.set(f"Packets: {c.total_packets}")
 
+    def _init_doppler_artists(self):
+        """Create the Doppler lines, reference lines and legends once."""
+        vel_line, = self.bfm_vel_ax.plot(
+            [], [], color="#e74c3c", linewidth=1.5, label="Mean Velocity"
+        )
+        self.bfm_vel_ax.axhline(0, color="k", linestyle="--", alpha=0.3)
+        absvel_line, = self.bfm_absvel_ax.plot(
+            [], [], color="#3498db", linewidth=1.5, label="Motion Magnitude"
+        )
+        self.bfm_absvel_ax.axhline(
+            self.WALK_THRESHOLD,
+            color="orange",
+            linestyle="--",
+            alpha=0.6,
+            label=f"Walking Threshold ({self.WALK_THRESHOLD:g})",
+        )
+        for ax in (self.bfm_vel_ax, self.bfm_absvel_ax):
+            ax.legend(loc="upper right", fontsize=7)
+        self._doppler_artists = {
+            "vel": vel_line, "absvel": absvel_line, "vel_fill": None, "absvel_fill": None,
+        }
+        return self._doppler_artists
+
     def _update_live_plots(self):
         """
         Pull the last N packets from the *processed* buffer (which has the
@@ -1455,11 +1538,14 @@ class MainApp(tk.Tk):
             return
 
         N = 100  # rolling window
-        packets = list(c.processed_buffer)[-N:]
-        if len(packets) < 3:
+        # Chunks land ~1/s but this ticks every 500 ms; skip identical redraws.
+        drawn = (id(c.processed_buffer), c.processed_buffer.generation)
+        if drawn == self._doppler_drawn:
             return
-
-        df = pd.DataFrame(packets)
+        df = c.processed_buffer.tail(N)
+        if len(df) < 3:
+            return
+        self._doppler_drawn = drawn
         import re as _re
 
         sc_re = _re.compile(r"SCIDX_(-?\d+)_Ratio_(Real|Imag)$")
@@ -1493,50 +1579,30 @@ class MainApp(tk.Tk):
         abs_velocity = np.abs(mean_velocity)
         x = np.arange(len(mean_velocity))
 
-        # Top — signed velocity
-        self.bfm_vel_ax.clear()
-        self.bfm_vel_ax.plot(
-            x, mean_velocity, color="#e74c3c", linewidth=1.5, label="Mean Velocity"
-        )
-        self.bfm_vel_ax.fill_between(x, mean_velocity, alpha=0.3, color="#e74c3c")
-        self.bfm_vel_ax.axhline(0, color="k", linestyle="--", alpha=0.3)
+        # Update artists in place; clearing and rebuilding both axes cost ~130 ms per tick.
+        art = self._doppler_artists or self._init_doppler_artists()
+        art["vel"].set_data(x, mean_velocity)
+        art["absvel"].set_data(x, abs_velocity)
+        for key, ax, y, color in (
+            ("vel_fill", self.bfm_vel_ax, mean_velocity, "#e74c3c"),
+            ("absvel_fill", self.bfm_absvel_ax, abs_velocity, "#3498db"),
+        ):
+            if art[key] is not None:
+                art[key].remove()
+            art[key] = ax.fill_between(x, y, alpha=0.3, color=color)
         self.bfm_vel_ax.set_title(
-            f"Doppler Velocity Time-Series — last {len(packets)} packets",
+            f"Doppler Velocity Time-Series — last {len(df)} packets",
             fontsize=9,
             fontweight="bold",
             pad=2,
         )
-        self.bfm_vel_ax.set_ylabel("Phase Velocity (rad/packet)", fontsize=8)
-        self.bfm_vel_ax.tick_params(labelsize=7)
-        self.bfm_vel_ax.grid(True, alpha=0.3)
-        self.bfm_vel_ax.legend(loc="upper right", fontsize=7)
+        # Rescale to the new window; include y=0 so the fills stay anchored.
+        for ax in (self.bfm_vel_ax, self.bfm_absvel_ax):
+            ax.relim()
+            ax.update_datalim([(0, 0)])
+            ax.autoscale_view()
 
-        # Bottom — motion magnitude with walking threshold
-        self.bfm_absvel_ax.clear()
-        self.bfm_absvel_ax.plot(
-            x, abs_velocity, color="#3498db", linewidth=1.5, label="Motion Magnitude"
-        )
-        self.bfm_absvel_ax.fill_between(x, abs_velocity, alpha=0.3, color="#3498db")
-        self.bfm_absvel_ax.axhline(
-            self.WALK_THRESHOLD,
-            color="orange",
-            linestyle="--",
-            alpha=0.6,
-            label=f"Walking Threshold ({self.WALK_THRESHOLD:g})",
-        )
-        self.bfm_absvel_ax.set_title(
-            "Motion Magnitude (used for activity detection)",
-            fontsize=9,
-            fontweight="bold",
-            pad=2,
-        )
-        self.bfm_absvel_ax.set_ylabel("|Velocity| (rad/packet)", fontsize=8)
-        self.bfm_absvel_ax.set_xlabel("Packet Number", fontsize=8)
-        self.bfm_absvel_ax.tick_params(labelsize=7)
-        self.bfm_absvel_ax.grid(True, alpha=0.3)
-        self.bfm_absvel_ax.legend(loc="upper right", fontsize=7)
-
-        self.bfm_doppler_fig.tight_layout()
+        # The figure's tight_layout=True already re-lays out on every draw.
         self.bfm_doppler_canvas.draw_idle()
 
         # Feature panel
@@ -2002,6 +2068,8 @@ class MainApp(tk.Tk):
         X_train_p = pca.fit_transform(X_train)
         X_test_p  = pca.transform(X_test)
 
+        from tensorflow.keras import layers, models, callbacks
+
         num_classes = len(le.classes_)
         model = models.Sequential([
             layers.Input(shape=(PCA_COMPONENTS,)),
@@ -2146,23 +2214,27 @@ class MainApp(tk.Tk):
 
         # Generous multiple of the expected packet count so re-ordering and
         # duplicate drops still cover the whole span.
-        rows = list(c.packet_buffer)[-(8 * T):]
-        if len(rows) < 2:
+        df = c.packet_buffer.tail(8 * T)
+        if len(df) < 2:
             return "Waiting for BFM data…"
 
-        if time.time() - float(rows[-1].get("pc_timestamp", 0.0)) > BFM_RT_STALE_S:
+        pc_newest = df["pc_timestamp"].iloc[-1] if "pc_timestamp" in df else 0.0
+        if time.time() - float(pc_newest) > BFM_RT_STALE_S:
             return "No live data"
 
-        cols = self._resolve_bfm_rt_cols(rows[-1])
+        cols = self._resolve_bfm_rt_cols(df.columns)
         if cols is None:
             return "No subcarrier columns"
         mag_cols, phase_cols = cols
 
-        t = np.array([r.get("timestamp", np.nan) for r in rows], dtype=np.float64)
+        if "timestamp" in df:
+            t = pd.to_numeric(df["timestamp"], errors="coerce").to_numpy(np.float64)
+        else:
+            t = np.full(len(df), np.nan)
         finite = np.isfinite(t)
         if finite.sum() < 2:
             return "Waiting for BFM data…"
-        rows = [r for r, ok in zip(rows, finite) if ok]
+        rows = np.flatnonzero(finite)   # df positions of the usable packets
         t = t[finite]
 
         # chronological order, then drop duplicate timestamps (prep.py)
@@ -2179,9 +2251,9 @@ class MainApp(tk.Tk):
         pick = np.where(np.abs(t[j - 1] - grid) <= np.abs(t[j] - grid), j - 1, j)
         gap = np.abs(t[pick] - grid) > (2.0 / fs)
 
-        sel = [rows[order[p]] for p in pick]
-        raw_mag = np.array([[r[c] for c in mag_cols] for r in sel], dtype=np.float32)
-        raw_phase = np.array([[r[c] for c in phase_cols] for r in sel], dtype=np.float64)
+        sel = rows[order[pick]]
+        raw_mag = df[mag_cols].to_numpy(dtype=np.float32)[sel]
+        raw_phase = df[phase_cols].to_numpy(dtype=np.float64)[sel]
 
         # prep.py: log the (heavy-tailed, multiplicative) ratio magnitudes, and
         # wrap the phases back onto (-pi, pi]

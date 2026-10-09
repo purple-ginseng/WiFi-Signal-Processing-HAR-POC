@@ -5,6 +5,7 @@ import time
 
 import joblib
 import numpy as np
+import pandas as pd
 import pytest
 
 import main_gui3
@@ -44,7 +45,7 @@ class Detector:
 
 def _detector_with_rows(rows, **kw):
     c = FakeCollector()
-    c.packet_buffer.extend(rows)
+    c.packet_buffer.append(pd.DataFrame(rows))
     return Detector(c, **kw)
 
 

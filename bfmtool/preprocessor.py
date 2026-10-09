@@ -38,17 +38,19 @@ def decompress_bfm_from_angles(bfm_angles, Nc, Nr):
     
     return bfm_complex
 
-def process_bfm_dataframe(df):
+def process_bfm_dataframe(df, verbose=True):
     """
     Loads and processes a BFM DataFrame using fully vectorized operations.
     """
-    print(f"Original data shape: {df.shape}")
+    if verbose:
+        print(f"Original data shape: {df.shape}")
 
     # --- 1. Vectorized Data Extraction ---
     # Extract subcarrier indices just once to build column names
     subcarrier_indices = sorted(list(set([int(re.search(r'SCIDX_(-?\d+)_', col).group(1)) for col in df.columns if col.startswith('SCIDX')])))
     num_subcarriers = len(subcarrier_indices)
-    print(f"Found {num_subcarriers} subcarriers.")
+    if verbose:
+        print(f"Found {num_subcarriers} subcarriers.")
 
     # Select columns for phi and psi in the correct order
     phi_cols = [f'SCIDX_{scidx}_phi11' for scidx in subcarrier_indices]
@@ -97,13 +99,14 @@ def process_bfm_dataframe(df):
 
 
 class BFMPreprocessor():
-    def __init__(self, dir : str):
+    def __init__(self, dir : str, verbose : bool = True):
         self.dir = Path(dir)
+        self.verbose = verbose
         self.processed_file = set()
 
     def process_file(self, filepath : str, save_to : str):
         df = pd.read_csv(filepath)
-        df = process_bfm_dataframe(df)
+        df = process_bfm_dataframe(df, verbose=self.verbose)
         df.to_csv(save_to, index = False)
         self.processed_file.add(save_to)
 

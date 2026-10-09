@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 
 import main_gui3
-from conftest import (SAMPLE_PCAP, FakeCollector, FakeModel, make_packet_rows,
+from conftest import (SAMPLE_PCAP, FakeCollector, FakeModel, make_packet_frame,
                       make_ratio_frame, pump_until, run_until)
 
 pytestmark = pytest.mark.gui
@@ -125,8 +125,7 @@ def _feed_processed(collector, delay, t_offset, n=12):
     def go():
         time.sleep(delay)
         base = time.time() + t_offset
-        rows = make_ratio_frame(n, t0=base, fs=50.0).to_dict("records")
-        collector.processed_buffer.extend(rows)
+        collector.processed_buffer.append(make_ratio_frame(n, t0=base, fs=50.0))
     threading.Thread(target=go, daemon=True).start()
 
 
@@ -195,8 +194,8 @@ def test_bfm_session_with_no_packets_reports_orange(gui3_app, tmp_path):
 def test_bfm_session_clears_stale_buffers_first(gui3_app):
     app = gui3_app
     fake = FakeCollector()
-    fake.processed_buffer.extend(make_ratio_frame(3, t0=1.0).to_dict("records"))
-    fake.packet_buffer.extend(make_packet_rows(3))
+    fake.processed_buffer.append(make_ratio_frame(3, t0=1.0))
+    fake.packet_buffer.append(make_packet_frame(3))
     app.bfm_collector = fake
     app._do_bfm_collection("alice", "walking", "", 1)
     assert len(fake.packet_buffer) == 0
@@ -241,7 +240,7 @@ def test_status_panel_reflects_collector_state(gui3_app):
     app = gui3_app
     fake = FakeCollector(running=True, connected=True, status="Connected ✓")
     fake.total_downloaded, fake.total_processed, fake.total_packets = 3, 2, 22
-    fake.packet_buffer.extend(make_packet_rows(4))
+    fake.packet_buffer.append(make_packet_frame(4))
     app.bfm_collector = fake
 
     app._update_status_panel()
@@ -269,17 +268,45 @@ def test_live_plots_update_feature_panel(gui3_app):
     fake = FakeCollector()
     app.bfm_collector = fake
 
-    fake.processed_buffer.extend(make_ratio_frame(2).to_dict("records"))
+    fake.processed_buffer.append(make_ratio_frame(2))
     app._update_live_plots()
     assert app.feat_mean_var.get() == "Mean Velocity: 0.0000"   # <3 rows: untouched
 
-    fake.processed_buffer.extend(make_ratio_frame(30, seed=5).to_dict("records"))
+    fake.processed_buffer.append(make_ratio_frame(30, seed=5))
     app._update_live_plots()
     assert app.feat_mean_var.get() != "Mean Velocity: 0.0000"
     assert app.feat_max_var.get().startswith("Max Velocity: ")
     assert app.feat_std_var.get().startswith("Std Dev: ")
     assert app.feat_energy_var.get().startswith("Energy: ")
     assert app.bfm_absvel_ax.get_xlabel() == "Packet Number"
+
+
+def test_live_plots_update_in_place_and_skip_unchanged(gui3_app, monkeypatch):
+    app = gui3_app
+    fake = FakeCollector()
+    app.bfm_collector = fake
+    draws = []
+    monkeypatch.setattr(app.bfm_doppler_canvas, "draw_idle", lambda: draws.append(1))
+
+    fake.processed_buffer.append(make_ratio_frame(10, seed=1))
+    app._update_live_plots()
+    vel_line = app._doppler_artists["vel"]
+    assert len(draws) == 1
+    assert len(vel_line.get_xdata()) == 9
+    assert "last 10 packets" in app.bfm_vel_ax.get_title()
+
+    app._update_live_plots()   # no new rows: nothing to redraw
+    assert len(draws) == 1
+
+    fake.processed_buffer.append(make_ratio_frame(50, seed=2))
+    app._update_live_plots()
+    assert len(draws) == 2
+    assert app._doppler_artists["vel"] is vel_line   # same artist, new data
+    assert len(vel_line.get_xdata()) == 59
+    assert "last 60 packets" in app.bfm_vel_ax.get_title()
+    assert app.bfm_vel_ax.get_xlim()[1] >= 58        # x-range follows the window
+    assert len(app.bfm_vel_ax.collections) == 1      # old fill removed, not stacked
+    assert len(app.bfm_vel_ax.get_lines()) == 2      # velocity + zero line only
 
 
 def test_streaming_tick_survives_bad_collector(gui3_app):
@@ -490,7 +517,7 @@ def test_start_pred_runs_once_and_stops(gui3_app, tmp_path, monkeypatch):
     app = gui3_app
     monkeypatch.setattr(main_gui3, "BFM_MODEL_PATHS", [_bundle_file(tmp_path, hop_s=0.02)])
     fake = FakeCollector()
-    fake.packet_buffer.extend(make_packet_rows(80))
+    fake.packet_buffer.append(make_packet_frame(80))
     app.bfm_collector = fake
 
     app._start_pred()

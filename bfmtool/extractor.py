@@ -171,7 +171,8 @@ class BFMExtractor:
     Extracts Beamforming (BFM) reports from pcap files into a CSV format
     by efficiently calling the tshark command-line tool.
     """
-    def __init__(self, tshark_path: str, csv_dir : str, show_progress: bool = True):
+    def __init__(self, tshark_path: str, csv_dir : str, show_progress: bool = True,
+                 verbose: bool = True):
         """
         Initializes the extractor.
 
@@ -184,6 +185,8 @@ class BFMExtractor:
                                costs a whole extra tshark run over the file.
                                Real-time callers should pass False; it roughly
                                halves per-file extraction cost.
+            verbose (bool): Print per-file progress lines. Real-time callers
+                               pass False to avoid flooding the console.
         """
         if not os.path.exists(tshark_path):
             raise FileNotFoundError(
@@ -193,6 +196,7 @@ class BFMExtractor:
         self._extracted_files = set()
         self.csv_dir = Path(csv_dir)
         self.show_progress = show_progress
+        self.verbose = verbose
         # Per-directory AppArmor verdict, see _readable_path. Confinement is a
         # property of the host policy and the directory, never of an individual
         # file, so probing it once per file wasted two tshark launches (~600 ms)
@@ -280,8 +284,9 @@ class BFMExtractor:
             return str(pcap_path), None
         self._staging_verdict[parent] = 'stage'
 
-        print(f"[Extractor] tshark cannot read {pcap_path} directly "
-              f"(AppArmor profile on tshark); using a staged copy.")
+        if verdict is None:   # announce once per directory, not on every chunk
+            print(f"[Extractor] tshark cannot read {pcap_path} directly "
+                  f"(AppArmor profile on tshark); using a staged copy.")
         return staged, staging_dir
 
     # Replace your pcap_to_csv method with this corrected version.
@@ -373,7 +378,8 @@ class BFMExtractor:
             print("Extraction finished, but no valid BFM reports were parsed.")
             return
             
-        print(f"Creating DataFrame from {len(data_for_df)} packets...")
+        if self.verbose:
+            print(f"Creating DataFrame from {len(data_for_df)} packets...")
         df = pd.DataFrame(data=data_for_df, columns=columns)
         
         # --- NEW: Insert the timestamp column at the beginning of the DataFrame ---
@@ -383,7 +389,8 @@ class BFMExtractor:
         
         df.to_csv(csv_path, index=False)
         self._extracted_files.add(csv_path)
-        print(f"✅ BFM data saved to {csv_path}")
+        if self.verbose:
+            print(f"✅ BFM data saved to {csv_path}")
 
     def extract(self, files : List[Path]):
         self.csv_dir.mkdir(exist_ok= True)
