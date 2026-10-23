@@ -14,7 +14,9 @@ xgboost>=2.1.0; sys_platform == "darwin"
 tensorflow-cpu>=2.16.0; sys_platform != "darwin"
 tensorflow>=2.16.0; sys_platform == "darwin"
 
-# PyTorch for macOS (CPU)
+# PyTorch (CPU). On Linux/WSL the default PyPI wheel is the multi-GB CUDA build,
+# so pull the CPU-only build from PyTorch's index instead. macOS wheels on PyPI are already CPU/MPS.
+--extra-index-url https://download.pytorch.org/whl/cpu
 torch>=2.0.0
 torchvision>=0.15.0
 torchaudio>=2.0.0
