@@ -210,7 +210,8 @@ def test_snapshot_merges_new_session_files(gui3_app, tmp_path):
     # a leftover from an earlier session must be ignored
     (tmp_path / "live_bfm_raw_csv" / "old.csv").write_text("timestamp,x\n1,2\n")
     shutil.copy(SAMPLE_PCAP, tmp_path / "live_bfm_pcap" / "old.pcap")
-    before = {"pcap": {"old.pcap"}, "raw": {"old.csv"}, "proc": set()}
+    before = {"pcap": main_gui3._dir_mtimes(str(tmp_path / "live_bfm_pcap")),
+              "raw": main_gui3._dir_mtimes(str(tmp_path / "live_bfm_raw_csv")), "proc": {}}
 
     make_ratio_frame(4).to_csv(tmp_path / "live_bfm_raw_csv" / "live_bfm0.csv", index=False)
     make_ratio_frame(6).to_csv(tmp_path / "live_bfm_raw_csv" / "live_bfm1.csv", index=False)
@@ -229,10 +230,29 @@ def test_snapshot_merges_new_session_files(gui3_app, tmp_path):
 
 
 def test_snapshot_with_nothing_new_writes_nothing(gui3_app, tmp_path):
-    before = {"pcap": set(), "raw": set(), "proc": set()}
+    before = {"pcap": {}, "raw": {}, "proc": {}}
     gui3_app._snapshot_session_to_bfm_dirs("a", "b", "", before)
     assert not (tmp_path / "bfm_raw_csv").exists()
     assert not (tmp_path / "bfm_pcap").exists()
+
+
+def test_snapshot_picks_up_reused_chunk_names_in_write_order(gui3_app, tmp_path):
+    """After Setup BFM the counter restarts at live_bfm0, reusing names from older runs."""
+    raw = tmp_path / "live_bfm_raw_csv"
+    raw.mkdir()
+    for i in (0, 1, 2):
+        make_ratio_frame(1, t0=float(i)).to_csv(raw / f"live_bfm{i}.csv", index=False)
+    before = {"pcap": {}, "raw": main_gui3._dir_mtimes(str(raw)), "proc": {}}
+
+    # this session rewrites live_bfm2, then live_bfm10 (name order would put 10 first)
+    for i, name in enumerate(["live_bfm2", "live_bfm10"]):
+        make_ratio_frame(2, t0=100.0 + i).to_csv(raw / f"{name}.csv", index=False)
+        os.utime(raw / f"{name}.csv", ns=(2 * 10**18 + i, 2 * 10**18 + i))
+
+    gui3_app._snapshot_session_to_bfm_dirs("a", "b", "", before)
+
+    merged = pd.read_csv(next((tmp_path / "bfm_raw_csv").glob("*.csv")))
+    assert merged["timestamp"].tolist() == [100.0, 100.1, 101.0, 101.1]
 
 
 # ─── Status panel / live plots ─────────────────────────────────────────────────

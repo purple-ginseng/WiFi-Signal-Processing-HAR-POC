@@ -11,14 +11,25 @@ import numpy as np
 
 BANDS = [(0.0, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 5.0)]
 
+# Quantised log-mag/phase steps are ~0.1; a subcarrier whose std is below this never changed
+FLAT_STD = 1e-6
+
 
 def _agg(feature):
-    """Summarise a per-subcarrier statistic across the 234 subcarriers."""
+    """Summarise a per-subcarrier statistic across subcarriers; zeros when none qualify."""
+    if feature.size == 0:
+        return [0.0] * 5
     return [feature.mean(), np.median(feature), feature.std(), np.percentile(feature, 10), np.percentile(feature, 90)]
 
 
 def window_features(mag, phase, fs):
-    """X: (T,S) log-magnitude, P: (T,S) wrapped phase. Returns 1-D float32 vector."""
+    """X: (T,S) log-magnitude, P: (T,S) wrapped phase. Returns 1-D float32 vector.
+
+    Size features use every subcarrier; ratio features (roughness, band fractions,
+    correlation) use only subcarriers that moved, since a flat one has no shape.
+    """
+    # float64: float32 mean removal leaves ~1e-7 residue, which ratios blow up on flat subcarriers
+    mag = np.asarray(mag, dtype=np.float64)
     timestamp_length = mag.shape[0]
     t = np.linspace(-1, 1, timestamp_length)[:, None]
 
@@ -28,38 +39,44 @@ def window_features(mag, phase, fs):
 
     # std(0) instead of std() to tell the function collapse for each column (subcarrier)
     # so that we can get one value for each subcarrier for one window
-    mag_std = mag_c.std(0) + 1e-8
+    mag_std = mag_c.std(0)
+    moving = mag_std > FLAT_STD
     mag_absolute_difference = np.abs(np.diff(mag_c, axis=0)).mean(0)
-    mag_roughness = mag_absolute_difference / mag_std
+    mag_roughness = mag_absolute_difference[moving] / mag_std[moving]
 
     # find wrapped first differences of phase
     # find differences between phase can caused unwrapped phase again
     # so we need to do phase wrapping again here
     phase_difference = np.angle(np.exp(1j * np.diff(phase.astype(np.float64), axis=0)))
     phase_absolute_difference = np.abs(phase_difference).mean(0)
-    phase_std = phase_difference.std(0) + 1e-8
+    phase_std = phase_difference.std(0)
+    phase_moving = phase_std > FLAT_STD
+    phase_roughness = phase_absolute_difference[phase_moving] / phase_std[phase_moving]
 
     # 25 Features: 5 x Mag_Std, Mag_Absolute_Difference, Mag_Roughness, Phase_Absolute_Difference, Phase_Roughness
-    feats = _agg(mag_std) + _agg(mag_absolute_difference) + _agg(mag_roughness) + _agg(phase_absolute_difference) + _agg(phase_absolute_difference / phase_std)
+    feats = _agg(mag_std) + _agg(mag_absolute_difference) + _agg(mag_roughness) + _agg(phase_absolute_difference) + _agg(phase_roughness)
 
     # convert from value at each time to content at each frequency, preserving information
     # compute power for each frequency bin (band), use fraction of power as feature
     w = np.hanning(timestamp_length)[:, None] # to smoothly join the repeated 20 samples in rfft
-    f1 = np.fft.rfft(mag_c * w, axis=0)
+    f1 = np.fft.rfft(mag_c[:, moving] * w, axis=0)
     power = (f1.real ** 2 + f1.imag ** 2)
     f2 = np.fft.rfftfreq(timestamp_length, 1 / fs)
     total_power = power.sum(0) + 1e-12
     frac = np.stack([power[(f2 >= low) & (f2 < high)].sum(0) / total_power for low, high in BANDS])
     for k in range(frac.shape[0]):
-        feats += [frac[k].mean(), np.median(frac[k]), frac[k].std()]
+        feats += _agg(frac[k])[:3] # mean, median, std
 
-    # magnitude correlation within subcarriers
-    subcarrier_num = mag_c.shape[1]
-    z_score = mag_c / mag_std
-    correlation = (z_score.T @ z_score) / timestamp_length
-    iu = np.triu_indices(subcarrier_num, 1) # only extract the non-diagonal pairs
-    cv = correlation[iu]
-    feats += [cv.mean(), np.abs(cv).mean(), cv.std()] # np.abs() to prevent + and - cancellation
+    # magnitude correlation between moving subcarriers; flat ones have no defined z-score
+    subcarrier_num = int(moving.sum())
+    if subcarrier_num >= 2:
+        z_score = mag_c[:, moving] / mag_std[moving]
+        correlation = (z_score.T @ z_score) / timestamp_length
+        iu = np.triu_indices(subcarrier_num, 1) # only extract the non-diagonal pairs
+        cv = correlation[iu]
+        feats += [cv.mean(), np.abs(cv).mean(), cv.std()] # np.abs() to prevent + and - cancellation
+    else:
+        feats += [0.0, 0.0, 0.0]
 
     return np.asarray(feats, dtype=np.float32)
 

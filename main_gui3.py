@@ -63,6 +63,12 @@ def _bfm_csv_filename(data_format, subject, activity, description, timestamp):
     session_name = _session_name(subject, activity, description)
     return f"bfm_{data_format}_data_{session_name}_{timestamp}.csv"
 
+def _dir_mtimes(d):
+    """{filename: mtime_ns} for the regular files in d; empty if d is missing."""
+    if not os.path.isdir(d):
+        return {}
+    return {e.name: e.stat().st_mtime_ns for e in os.scandir(d) if e.is_file()}
+
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
 DATA_DIR      = './data'
 PCAP_PATH     = './data/wifisignal.pcap'
@@ -1233,23 +1239,12 @@ class MainApp(tk.Tk):
         # running so the finally block can trim to exactly the requested window.
         capture_start_ts = None
 
-        # Mark which files were already in the live dirs before this session
+        # Mark which files were already in the live dirs before this session.
+        # Chunk names restart at live_bfm0 after Setup BFM, so mtimes are kept too.
         snapshot_before = {
-            "pcap": (
-                set(os.listdir("live_bfm_pcap"))
-                if os.path.isdir("live_bfm_pcap")
-                else set()
-            ),
-            "raw": (
-                set(os.listdir("live_bfm_raw_csv"))
-                if os.path.isdir("live_bfm_raw_csv")
-                else set()
-            ),
-            "proc": (
-                set(os.listdir("live_bfm_processed_csv"))
-                if os.path.isdir("live_bfm_processed_csv")
-                else set()
-            ),
+            "pcap": _dir_mtimes("live_bfm_pcap"),
+            "raw": _dir_mtimes("live_bfm_raw_csv"),
+            "proc": _dir_mtimes("live_bfm_processed_csv"),
         }
 
         try:
@@ -1405,14 +1400,15 @@ class MainApp(tk.Tk):
             f"bfm_data_{_session_name(subject, activity, description)}_{ts}"
         )
 
-        def _new_files(d, before_set):
-            if not os.path.isdir(d):
-                return []
-            return sorted(
+        def _new_files(d, before):
+            # new name, or a reused name rewritten during this session;
+            # write order, since name order puts live_bfm10 before live_bfm2
+            now = _dir_mtimes(d)
+            return [
                 os.path.join(d, f)
-                for f in (set(os.listdir(d)) - before_set)
-                if os.path.isfile(os.path.join(d, f))
-            )
+                for f in sorted(now, key=lambda f: (now[f], f))
+                if before.get(f) != now[f]
+            ]
 
         pcap_files = _new_files("live_bfm_pcap", snapshot_before["pcap"])
         raw_files = _new_files("live_bfm_raw_csv", snapshot_before["raw"])
