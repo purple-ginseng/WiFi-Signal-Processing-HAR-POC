@@ -42,6 +42,46 @@ def file_metadata(filepath):
 
 ColumnInfo = tt.Dict[str, tt.Union[tt.List[str], tt.List[int]]]
 
+# Subcarriers in one compressed VHT BFM report (Ng=1), by channel width in MHz.
+BFM_SUBCARRIERS_TO_MHZ = {52: 20, 108: 40, 234: 80}
+BFM_MHZ_TO_SUBCARRIERS = {mhz: n for n, mhz in BFM_SUBCARRIERS_TO_MHZ.items()}
+FULL_BFM_MHZ = 80
+# At or below this share of narrow reports, they are blips to drop, not a re-record.
+NARROW_BLIP_SHARE = 0.01
+
+
+def bfm_row_widths_mhz(df):
+    """Per-row channel width (MHz) from its subcarrier count; NaN if unrecognised."""
+    cols = [c for c in df.columns if c.endswith("_Ratio_Real")] or [
+        c for c in df.columns if c.endswith("_Ratio_Mag")
+    ]
+    if not cols:
+        return pd.Series(np.nan, index=df.index)
+    # Merged sessions leave a narrow row's missing subcarriers as NaN.
+    return df[cols].notna().sum(axis=1).map(BFM_SUBCARRIERS_TO_MHZ)
+
+
+def narrow_bfm_warning(df):
+    """Warning text if any report is narrower than FULL_BFM_MHZ, else None."""
+    widths = bfm_row_widths_mhz(df)
+    narrow = widths[widths < FULL_BFM_MHZ]
+    if narrow.empty:
+        return None
+    seen = ", ".join(
+        f"{int(w)} MHz ({BFM_MHZ_TO_SUBCARRIERS[int(w)]} subcarriers)"
+        for w in sorted(narrow.unique())
+    )
+    share = len(narrow) / len(df)
+    advice = (
+        "These are isolated blips: drop those rows; no need to re-record."
+        if share <= NARROW_BLIP_SHARE
+        else "The router's rate control slid down during this session; re-record it."
+    )
+    return (
+        f"{len(narrow)} of {len(df)} BFM reports ({share:.1%}) are {seen} instead of "
+        f"{FULL_BFM_MHZ} MHz ({BFM_MHZ_TO_SUBCARRIERS[FULL_BFM_MHZ]} subcarriers). {advice}"
+    )
+
 def get_bfm_columns(df) -> ColumnInfo: 
     """Extracts column names and subcarrier indices.
 
@@ -122,6 +162,25 @@ def get_df_from_dir(data_dir):
     return df_combined
 
 
+def _unwrap_present(phase):
+    """Unwrap each row across only its non-NaN subcarriers.
+
+    np.unwrap lets one NaN poison every later subcarrier. Mixed-width sessions
+    leave NaN in columns that only narrow reports carry.
+    """
+    present = ~np.isnan(phase)
+    if present.all():
+        return np.unwrap(phase)
+    out = np.full_like(phase, np.nan)
+    # One unwrap per distinct missing-column pattern (one per channel width in practice)
+    patterns, row_pattern = np.unique(present, axis=0, return_inverse=True)
+    for k, cols in enumerate(patterns):
+        rows = np.flatnonzero(row_pattern.ravel() == k)
+        if cols.any():
+            out[np.ix_(rows, cols)] = np.unwrap(phase[np.ix_(rows, cols)])
+    return out
+
+
 def append_mag_phase(df):
     col_dict = get_bfm_columns(df)
 
@@ -134,7 +193,7 @@ def append_mag_phase(df):
     imag_data = df[col_dict['imag_col']].to_numpy()
 
     mag_data = (real_data**2 + imag_data ** 2) ** (1/2)
-    phase_data = np.unwrap(np.arctan2(imag_data, real_data))
+    phase_data = _unwrap_present(np.arctan2(imag_data, real_data))
 
     mag_col = [f'SCIDX_{scidx}_Ratio_Mag' for scidx in subcarrier_indices]
     phase_col = [f'SCIDX_{scidx}_Ratio_Phase' for scidx in subcarrier_indices]

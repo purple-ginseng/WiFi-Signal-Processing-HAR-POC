@@ -34,7 +34,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from bfmtool.collector import BFMCollector
 from bfmtool.extractor import BFMExtractor
 from bfmtool.preprocessor import BFMPreprocessor
-from bfmtool.utils import append_mag_phase, get_bfm_columns
+from bfmtool.utils import append_mag_phase, get_bfm_columns, narrow_bfm_warning
 
 from functools import partial
 
@@ -146,6 +146,8 @@ class MainApp(tk.Tk):
         self.bfm_collected = set()
         self.bfm_extracted = set()
         self.bfm_processed = set()
+        # Set by _merge_bfm_session_csv when the session has narrow BFM reports.
+        self.bfm_width_warning = None
 
     def _on_close(self):
         self._stop_csi.set()
@@ -342,6 +344,15 @@ class MainApp(tk.Tk):
             self.bfm_collector.filename = partial(
                 self.generate_bfm_filename, subject, activity, description
             )
+            self.bfm_width_warning = None
+
+            # Rate control can slide to 40 MHz (108-subcarrier BFM); a reset restores 80 MHz.
+            try:
+                rate = self.bfm_collector.reset_rate_control()
+                print(f"[BFM] Rate control reset: {rate or 'no station listed'}")
+            except Exception as e:
+                print(f"[BFM WARNING] Rate control reset failed: {e}")
+
             self.bfm_collector.run_tcpdump()
             start_ts = time.time()
 
@@ -480,6 +491,18 @@ class MainApp(tk.Tk):
                                 f"and bfm_mag_phase_csv/{mp_name}",
                                 "green",
                             )
+                            width_warning = self.bfm_width_warning
+                            if width_warning:
+                                status_text, status_color = (
+                                    f"{status_text}\n⚠ {width_warning}",
+                                    "orange",
+                                )
+                                self.after(
+                                    0,
+                                    lambda: messagebox.showwarning(
+                                        "BFM bandwidth", width_warning
+                                    ),
+                                )
                         else:
                             status_text, status_color = (
                                 "[BFM] BFM reports were extracted, but preprocessing/merging "
@@ -564,6 +587,10 @@ class MainApp(tk.Tk):
 
         merged["subject"] = subject
         merged["activity"] = activity
+
+        self.bfm_width_warning = narrow_bfm_warning(merged)
+        if self.bfm_width_warning:
+            print(f"[BFM WARNING] {self.bfm_width_warning}")
 
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         ri_name = _bfm_csv_filename(

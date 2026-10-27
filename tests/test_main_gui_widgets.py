@@ -35,6 +35,7 @@ class FakeBFMCollector:
     def kill_iperf3(self): self._do("kill_iperf3")
     def close(self): self._do("close")
     def run_tcpdump(self): self._do("run_tcpdump")
+    def reset_rate_control(self): self._do("reset_rate_control"); return "tx bitrate: 80MHz"
     def stop_pcap_collection(self): self._do("stop_pcap_collection")
     def get_clock_offset(self): return self.offset
     def get_collected_files(self): return set(self.collected)
@@ -235,7 +236,7 @@ def test_bfm_collection_saves_session(gui_app, fake_bfmtool, tmp_path):
     app._do_bfm_collection("alice", "walking", "open", 1)
 
     assert c.filename is not None and c.filename().startswith("bfm_data_alice_walking_open_")
-    assert c.calls[3:] == ["run_tcpdump", "stop_pcap_collection"]
+    assert c.calls[3:] == ["reset_rate_control", "run_tcpdump", "stop_pcap_collection"]
     assert app.bfm_collected == c.collected
     assert app.bfm_extracted == fake_bfmtool["extractor"].extracted
 
@@ -255,6 +256,37 @@ def test_bfm_collection_saves_session(gui_app, fake_bfmtool, tmp_path):
     assert str(app.collect_msg.cget("foreground")) == "green"
     assert str(app.collect_btn.cget("state")) == "normal"
     assert app.progress["value"] == 0
+
+
+def test_bfm_collection_at_40mhz_saves_but_warns(gui_app, dialogs, fake_bfmtool, tmp_path):
+    app = gui_app
+    app._toggle_bfm_setup()
+    c = fake_bfmtool["collector"]
+    app._extract_bfm_for_plot = lambda p: []
+    start = time.time()
+    fake_bfmtool["preprocessor"].frame_factory = \
+        lambda: make_ratio_frame(10, t0=start + 0.3, fs=50.0, scidx=range(-58, 50))
+    c.collected = {Path("bfm_pcap") / "chunk0.pcap"}
+
+    app._do_bfm_collection("alice", "walking", "", 1)
+    app.update()                                   # run the after(0) dialog
+
+    assert len(list((tmp_path / "bfm_real_imag_csv").glob("*.csv"))) == 1
+    msg = app.collect_msg.cget("text")
+    assert msg.startswith("[BFM] Saved 10 rows")
+    assert "10 of 10 BFM reports (100.0%) are 40 MHz (108 subcarriers)" in msg
+    assert str(app.collect_msg.cget("foreground")) == "orange"
+    assert [(k, t) for k, t, _ in dialogs] == [("showwarning", "BFM bandwidth")]
+
+
+def test_bfm_collection_survives_failed_rate_reset(gui_app, fake_bfmtool, monkeypatch, capsys):
+    app = gui_app
+    app._toggle_bfm_setup()
+    app._extract_bfm_for_plot = lambda p: []
+    monkeypatch.setattr(FakeBFMCollector, "fail_on", "reset_rate_control")
+    app._do_bfm_collection("alice", "walking", "", 1)
+    assert "Rate control reset failed" in capsys.readouterr().out
+    assert fake_bfmtool["collector"].calls[-2:] == ["run_tcpdump", "stop_pcap_collection"]
 
 
 def test_bfm_collection_second_session_only_uses_new_files(gui_app, fake_bfmtool, tmp_path):

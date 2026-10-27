@@ -120,13 +120,57 @@ def test_bfm_collection_without_setup_is_rejected(gui3_app):
 
 
 # ─── Labeled session end-to-end with a fake collector ──────────────────────────
-def _feed_processed(collector, delay, t_offset, n=12):
+def _feed_processed(collector, delay, t_offset, n=12, **frame_kw):
     """Push ratio rows into processed_buffer after the session has started."""
     def go():
         time.sleep(delay)
         base = time.time() + t_offset
-        collector.processed_buffer.append(make_ratio_frame(n, t0=base, fs=50.0))
+        collector.processed_buffer.append(
+            make_ratio_frame(n, t0=base, fs=50.0, **frame_kw))
     threading.Thread(target=go, daemon=True).start()
+
+
+def test_bfm_session_resets_router_rate_before_timing(gui3_app):
+    app = gui3_app
+    fake = FakeCollector()
+    app.bfm_collector = fake
+    app._do_bfm_collection("alice", "walking", "", 1)
+    assert fake.calls.index("start_collection") < fake.calls.index("reset_rate_control")
+    waits = [i for i, c in enumerate(fake.calls) if isinstance(c, tuple)]
+    assert fake.calls.index("reset_rate_control") < waits[0]
+
+
+def test_bfm_session_at_40mhz_saves_but_warns(gui3_app, dialogs, tmp_path):
+    app = gui3_app
+    fake = FakeCollector()
+    app.bfm_collector = fake
+    _feed_processed(fake, delay=0.2, t_offset=0.0, scidx=range(-58, 50))
+
+    app._do_bfm_collection("alice", "walking", "", 1)
+    app.update()                                   # run the after(0) dialog
+
+    assert len(list((tmp_path / "bfm_real_imag_csv").glob("*.csv"))) == 1
+    msg = app.collect_msg.cget("text")
+    assert msg.startswith("Saved 12 BFM packets")
+    assert "12 of 12 BFM reports (100.0%) are 40 MHz (108 subcarriers)" in msg
+    assert str(app.collect_msg.cget("foreground")) == "orange"
+    assert [(k, t) for k, t, _ in dialogs] == [("showwarning", "BFM bandwidth")]
+    assert "re-record" in dialogs[0][2]
+
+
+def test_bfm_session_at_80mhz_has_no_warning(gui3_app, dialogs):
+    app = gui3_app
+    fake = FakeCollector()
+    app.bfm_collector = fake
+    _feed_processed(fake, delay=0.2, t_offset=0.0, scidx=range(-122, 112))
+
+    app._do_bfm_collection("alice", "walking", "", 1)
+    app.update()
+
+    assert app.collect_msg.cget("text").startswith("Saved 12 BFM packets")
+    assert "⚠" not in app.collect_msg.cget("text")
+    assert str(app.collect_msg.cget("foreground")) == "green"
+    assert dialogs == []
 
 
 def test_bfm_session_saves_trimmed_csvs(gui3_app, tmp_path):
@@ -281,6 +325,23 @@ def test_status_panel_reflects_collector_state(gui3_app):
     app._update_status_panel()
     assert app.status_var.get() == "⚪ Not set up"
     assert app.pkts_var.get() == "Packets: 0"
+
+
+@pytest.mark.parametrize("mhz, warned", [(None, False), (80, False), (40, True), (20, True)])
+def test_status_panel_bandwidth_warning(gui3_app, mhz, warned):
+    app = gui3_app
+    fake = FakeCollector()
+    fake.last_bfm_mhz = mhz
+    app.bfm_collector = fake
+    app._update_status_panel()
+    text = app.bw_var.get()
+    assert bool(text) is warned
+    if warned:
+        assert f"BFM reports are {mhz} MHz, not 80 MHz" in text
+
+    app.bfm_collector = None
+    app._update_status_panel()
+    assert app.bw_var.get() == ""
 
 
 def test_live_plots_update_feature_panel(gui3_app):

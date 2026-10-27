@@ -183,6 +183,92 @@ def test_processing_loop_fills_buffers_from_real_pcap(collector, tmp_path):
 
     assert (tmp_path / "live_bfm_raw_csv" / "live_bfm0.csv").is_file()
     assert (tmp_path / "live_bfm_processed_csv" / "live_bfm0.csv").is_file()
+    assert collector.last_bfm_mhz == 80          # fixture is an 80 MHz capture
+
+
+def _fake_pipeline(collector, monkeypatch, frame):
+    """Skip tshark/decompression: every chunk 'processes' into frame."""
+    monkeypatch.setattr(collector.bfm_extractor, "pcap_to_csv",
+                        lambda src, dst: Path(dst).write_text("raw\n"))
+    monkeypatch.setattr(collector.bfm_preprocessor, "process_file",
+                        lambda src, dst: frame.to_csv(dst, index=False))
+
+
+def _queue_chunk(collector, tmp_path, name="live_bfm0.pcap"):
+    local = tmp_path / "live_bfm_pcap" / name
+    local.write_bytes(b"pcap")
+    collector.download_queue.append(str(local))
+
+
+def test_processing_loop_flags_40mhz_chunk(collector, tmp_path, monkeypatch):
+    _fake_pipeline(collector, monkeypatch, make_ratio_frame(3, scidx=range(-58, 50)))
+    _queue_chunk(collector, tmp_path)
+
+    _run_processing(collector)
+
+    assert collector.last_bfm_mhz == 40
+    log = (tmp_path / collector.DEBUG_LOG).read_text()
+    assert log.count("[BANDWIDTH] BFM reports dropped to 40 MHz") == 1
+
+
+def test_processing_loop_logs_drop_once_per_transition(collector, tmp_path, monkeypatch):
+    _fake_pipeline(collector, monkeypatch, make_ratio_frame(3, scidx=range(-58, 50)))
+    for k in range(3):
+        _queue_chunk(collector, tmp_path, f"live_bfm{k}.pcap")
+
+    _run_processing(collector)
+
+    assert collector.total_packets == 9
+    log = (tmp_path / collector.DEBUG_LOG).read_text()
+    assert log.count("[BANDWIDTH]") == 1
+
+
+def test_processing_loop_logs_one_report_blip_mid_chunk(collector, tmp_path, monkeypatch):
+    chunk = pd.concat([make_ratio_frame(4, scidx=range(-122, 112)),
+                       make_ratio_frame(1, scidx=range(-58, 50)),
+                       make_ratio_frame(4, scidx=range(-122, 112))], ignore_index=True)
+    _fake_pipeline(collector, monkeypatch, chunk)
+    _queue_chunk(collector, tmp_path)
+
+    _run_processing(collector)
+
+    assert collector.last_bfm_mhz == 80            # newest report is full width again
+    log = (tmp_path / collector.DEBUG_LOG).read_text()
+    assert "[BANDWIDTH] BFM reports dropped to 40 MHz (1 of 9 in this chunk)" in log
+
+
+def test_processing_loop_ignores_unrecognised_width(collector, tmp_path, monkeypatch):
+    _fake_pipeline(collector, monkeypatch, make_ratio_frame(3))   # 8 subcarriers
+    _queue_chunk(collector, tmp_path)
+
+    _run_processing(collector)
+
+    assert collector.total_packets == 3
+    assert collector.last_bfm_mhz is None
+
+
+# ─── Router rate-control reset ─────────────────────────────────────────────────
+def test_reset_rate_control_without_connection_is_skipped(collector, tmp_path):
+    assert collector.reset_rate_control() is None
+    assert "rate reset skipped" in (tmp_path / collector.DEBUG_LOG).read_text()
+
+
+def test_reset_rate_control_delegates_and_logs(collector, tmp_path):
+    class Router:
+        client = object()
+        def reset_rate_control(self): return "tx bitrate:\t234.0 MBit/s VHT-MCS 5 80MHz"
+    collector.bfm_collector = Router()
+    assert collector.reset_rate_control().endswith("80MHz")
+    assert "rate control reset: tx bitrate" in (tmp_path / collector.DEBUG_LOG).read_text()
+
+
+def test_reset_rate_control_swallows_ssh_errors(collector, tmp_path):
+    class Router:
+        client = object()
+        def reset_rate_control(self): raise OSError("channel closed")
+    collector.bfm_collector = Router()
+    assert collector.reset_rate_control() is None
+    assert "rate reset failed: channel closed" in (tmp_path / collector.DEBUG_LOG).read_text()
 
 
 @pytest.mark.tshark

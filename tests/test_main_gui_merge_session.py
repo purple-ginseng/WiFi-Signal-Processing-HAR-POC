@@ -146,3 +146,25 @@ def test_subject_column_uses_gui_value_verbatim(workdir):
         assert df["subject"].tolist() == ["Bob Smith"] * 3
         assert df["activity"].tolist() == ["standing"] * 3
         assert "label" not in df.columns
+
+
+def test_merge_records_bandwidth_warning(workdir):
+    processed = workdir / "bfm_processed_csv"
+    raw_paths = _write_chunks(processed, [
+        make_ratio_frame(4, scidx=range(-122, 112)),
+        make_ratio_frame(2, t0=T0 + 1, scidx=range(-58, 50)),
+    ])
+    stub = _stub(processed)
+    (names, rows) = main_gui.MainApp._merge_bfm_session_csv(
+        stub, "alice", "walking", "", raw_paths)
+    assert rows == 6 and names is not None        # narrow sessions are still saved
+    assert stub.bfm_width_warning.startswith("2 of 6 BFM reports (33.3%) are 40 MHz")
+
+
+def test_merge_full_width_clears_warning(workdir):
+    processed = workdir / "bfm_processed_csv"
+    raw_paths = _write_chunks(processed, [make_ratio_frame(4, scidx=range(-122, 112))])
+    stub = _stub(processed)
+    stub.bfm_width_warning = "stale"
+    main_gui.MainApp._merge_bfm_session_csv(stub, "alice", "walking", "", raw_paths)
+    assert stub.bfm_width_warning is None

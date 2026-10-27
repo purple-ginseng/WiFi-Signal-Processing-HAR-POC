@@ -135,6 +135,22 @@ def parsed_bfm_to_list(bfm : List[Dict]):
 
     return data
 
+def parsed_bfm_to_record(bfm : List[Dict]) -> Dict[str, int]:
+    """One packet's angles keyed by its own SCIDX labels, e.g. {'SCIDX_-122_phi11': 16, ...}."""
+    record = {}
+    for subcarrier in bfm:
+        record[f"SCIDX_{subcarrier['SCIDX']}_phi11"] = subcarrier['phi11']
+        record[f"SCIDX_{subcarrier['SCIDX']}_psi21"] = subcarrier['psi21']
+    return record
+
+def records_to_bfm_df(records : List[Dict[str, int]]) -> pd.DataFrame:
+    """Rows of mixed channel widths line up by SCIDX; tones a row lacks are NaN."""
+    df = pd.DataFrame.from_records(records)
+    def key(col):
+        _, scidx, angle = col.split('_')
+        return int(scidx), angle
+    return df[sorted(df.columns, key=key)]
+
 def parsed_bfm_list_to_df(bfm_list : List[List[Dict]]) -> pd.DataFrame:
     """
     convert list of parsed bfm (for many packet) to dataframe
@@ -149,19 +165,7 @@ def parsed_bfm_list_to_df(bfm_list : List[List[Dict]]) -> pd.DataFrame:
         [SCIDX_-122_phi11,  SCIDX_-122_psi21,  SCIDX_-121_phi11,  ...  ,SCIDX_121_psi21,  SCIDX_122_phi11,  SCIDX_122_psi21]
     """
 
-    # generate column names
-    columns = []
-    for subcarrier in bfm_list[0]:
-        scidx = subcarrier['SCIDX'] # subcarrier index
-        columns.append(f"SCIDX_{scidx}_phi11")
-        columns.append(f"SCIDX_{scidx}_psi21")
-
-    data = []
-    
-    for bfm in bfm_list:
-        data.append(parsed_bfm_to_list(bfm))
-    
-    return pd.DataFrame(data = data, columns = columns)
+    return records_to_bfm_df([parsed_bfm_to_record(bfm) for bfm in bfm_list])
     
 
 
@@ -331,7 +335,6 @@ class BFMExtractor:
         command = [self.tshark_path, '-r', pcap_path, '-Y', display_filter, '-V']
         
         data_for_df = []
-        columns = []
         # --- NEW: A list to hold our timestamps ---
         timestamps_list = []
         mac_address_list = []
@@ -358,15 +361,10 @@ class BFMExtractor:
                 # --- NEW: Add the found timestamp to our list ---
                 timestamps_list.append(timestamp)
                 
-                data_for_df.append(parsed_bfm_to_list(parsed_bfm))
+                # Keyed by each packet's own SCIDX: a chunk can mix 80 and 40 MHz reports.
+                data_for_df.append(parsed_bfm_to_record(parsed_bfm))
 
                 mac_address_list.append(mac_addresses)
-                
-                if not columns:
-                    for subcarrier in parsed_bfm:
-                        scidx = subcarrier['SCIDX']
-                        columns.append(f"SCIDX_{scidx}_phi11")
-                        columns.append(f"SCIDX_{scidx}_psi21")
 
             process.wait()
 
@@ -380,7 +378,7 @@ class BFMExtractor:
             
         if self.verbose:
             print(f"Creating DataFrame from {len(data_for_df)} packets...")
-        df = pd.DataFrame(data=data_for_df, columns=columns)
+        df = records_to_bfm_df(data_for_df)
         
         # --- NEW: Insert the timestamp column at the beginning of the DataFrame ---
         df = pd.concat((pd.DataFrame(mac_address_list), df), axis = 1)

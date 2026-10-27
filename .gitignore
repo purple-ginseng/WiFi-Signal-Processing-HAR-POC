@@ -180,3 +180,6 @@ CLAUDE.md
 
 # Python version pin (local venv)
 .python-version
+
+# Claude Code personal settings
+.claude/settings.local.json

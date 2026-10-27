@@ -33,3 +33,24 @@ def test_not_connected_still_reports_when_quiet(capsys):
     c = BFMCollector("192.0.2.1", "root", "x", verbose=False)
     assert c.run_command("true") == (None, None)
     assert "Cannot run command" in capsys.readouterr().out
+
+
+def test_reset_rate_control_resets_then_reports_bitrate():
+    c = BFMCollector("192.0.2.1", "root", "x", verbose=False)
+    c.client = _FakeClient()
+    assert c.reset_rate_control() == "1234"
+    (cmd,) = c.client.commands
+    assert cmd.index("iw dev phy0-ap0 set bitrates") < cmd.index("station dump")
+    assert "grep 'tx bitrate'" in cmd
+
+
+def test_reset_rate_control_takes_interface_name():
+    c = BFMCollector("192.0.2.1", "root", "x", verbose=False)
+    c.client = _FakeClient()
+    c.reset_rate_control(dev="wlan1")
+    assert "iw dev wlan1 set bitrates" in c.client.commands[0]
+
+
+def test_reset_rate_control_not_connected_is_none(capsys):
+    c = BFMCollector("192.0.2.1", "root", "x", verbose=False)
+    assert c.reset_rate_control() is None

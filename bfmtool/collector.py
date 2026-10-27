@@ -141,6 +141,17 @@ class BFMCollector:
     def kill_iperf3(self):
         self.run_command('killall -9 iperf3')
 
+    def reset_rate_control(self, dev="phy0-ap0"):
+        """Restart the AP's tx rate control; recovers a slide to 40 MHz BFM.
+
+        Returns the stations' 'tx bitrate' lines, or None if not connected.
+        """
+        output, _ = self.run_command(
+            f"iw dev {dev} set bitrates; sleep 1; "
+            f"iw dev {dev} station dump | grep 'tx bitrate'"
+        )
+        return output
+
     def fast(self):
         self._is_fast = True
     

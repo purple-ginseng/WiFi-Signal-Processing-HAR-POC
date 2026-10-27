@@ -78,10 +78,15 @@ class FakeCollector:
         self.total_packets = 0
         self.calls = []
         self.clock_offset = 0.0
+        self.last_bfm_mhz = None
 
     def start_collection(self):
         self.calls.append("start_collection")
         self.running = True
+
+    def reset_rate_control(self):
+        self.calls.append("reset_rate_control")
+        return "tx bitrate:\t234.0 MBit/s VHT-MCS 5 80MHz VHT-NSS 1"
 
     def stop_collection(self):
         self.calls.append("stop_collection")

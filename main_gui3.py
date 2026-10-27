@@ -31,7 +31,13 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from bfmtool.collector import BFMCollector
 from bfmtool.extractor import BFMExtractor
 from bfmtool.preprocessor import BFMPreprocessor
-from bfmtool.utils import append_mag_phase, get_bfm_columns
+from bfmtool.utils import (
+    FULL_BFM_MHZ,
+    append_mag_phase,
+    bfm_row_widths_mhz,
+    get_bfm_columns,
+    narrow_bfm_warning,
+)
 
 import re
 import rtbfm
@@ -236,6 +242,9 @@ class LiveDataCollector:
         self.total_downloaded = 0
         self.total_processed = 0
         self.total_packets = 0
+        # Channel width of the newest BFM chunk; None until one is recognised.
+        self.last_bfm_mhz = None
+        self._last_chunk_narrow = False
 
         # Stall-detection watchdog: if nothing has advanced for
         # STALL_THRESHOLD seconds, the explicit tcpdump command is re-issued.
@@ -446,6 +455,19 @@ class LiveDataCollector:
             self.processing_thread.join(timeout=3)
 
         self.connection_status = "Stopped"
+
+    def reset_rate_control(self):
+        """Reset the router's tx rate control (recovers a 40 MHz slide). Never raises."""
+        if self.bfm_collector is None or self.bfm_collector.client is None:
+            self._log("[RATE] router not connected, rate reset skipped")
+            return None
+        try:
+            out = self.bfm_collector.reset_rate_control()
+        except Exception as e:
+            self._log(f"[RATE] rate reset failed: {e}")
+            return None
+        self._log(f"[RATE] rate control reset: {out or 'no station listed'}")
+        return out
 
     def get_clock_offset(self):
         """Seconds to add to a host epoch to express it in the router's clock.
@@ -822,6 +844,18 @@ class LiveDataCollector:
                 if df_processed.empty:
                     continue
 
+                widths = bfm_row_widths_mhz(df_processed).dropna()
+                if not widths.empty:
+                    # Any narrow row counts: a one-report blip can sit mid-chunk.
+                    narrow = widths[widths < FULL_BFM_MHZ]
+                    if not narrow.empty and not self._last_chunk_narrow:
+                        self._log(
+                            f"[BANDWIDTH] BFM reports dropped to {int(narrow.min())} MHz "
+                            f"({len(narrow)} of {len(widths)} in this chunk)"
+                        )
+                    self._last_chunk_narrow = not narrow.empty
+                    self.last_bfm_mhz = int(widths.iloc[-1])
+
                 df_mag_phase = convert_real_imag_to_mag_phase(
                     df_processed, self.mag_cols, self.phase_cols
                 )
@@ -1097,6 +1131,11 @@ class MainApp(tk.Tk):
         ttk.Label(status_frame, textvariable=self.pkts_var).grid(
             row=0, column=4, padx=12
         )
+        # Empty unless BFM reports arrive narrower than 80 MHz.
+        self.bw_var = tk.StringVar(value="")
+        ttk.Label(status_frame, textvariable=self.bw_var, foreground="red").grid(
+            row=1, column=0, columnspan=5, sticky="w", padx=4
+        )
         for c in range(5):
             status_frame.columnconfigure(c, weight=1)
 
@@ -1255,6 +1294,9 @@ class MainApp(tk.Tk):
             # Spawn the SSH+tcpdump+SFTP+tshark+preprocess pipeline
             self.bfm_collector.start_collection()
 
+            # Rate control can slide to 40 MHz (108-subcarrier BFM); a reset restores 80 MHz.
+            self.bfm_collector.reset_rate_control()
+
             start_ts = time.time()
             capture_start_ts = start_ts + self.bfm_collector.get_clock_offset()
             self.progress.config(maximum=duration)
@@ -1350,14 +1392,25 @@ class MainApp(tk.Tk):
                             os.path.join("bfm_mag_phase_csv", mp_name), index=False
                         )
 
-                    self.collect_msg.config(
-                        text=(
-                            f"Saved {len(df_real_imag)} BFM packets → "
-                            f"bfm_real_imag_csv/{ri_name} and "
-                            f"bfm_mag_phase_csv/{mp_name}"
-                        ),
-                        foreground="green",
+                    saved_text = (
+                        f"Saved {len(df_real_imag)} BFM packets → "
+                        f"bfm_real_imag_csv/{ri_name} and "
+                        f"bfm_mag_phase_csv/{mp_name}"
                     )
+                    width_warning = narrow_bfm_warning(df_real_imag)
+                    if width_warning:
+                        self.collect_msg.config(
+                            text=f"{saved_text}\n⚠ {width_warning}", foreground="orange"
+                        )
+                        print(f"[BFM WARNING] {width_warning}")
+                        self.after(
+                            0,
+                            lambda: messagebox.showwarning(
+                                "BFM bandwidth", width_warning
+                            ),
+                        )
+                    else:
+                        self.collect_msg.config(text=saved_text, foreground="green")
                     print(
                         f"[BFM] Saved {len(df_real_imag)} records to "
                         f"bfm_real_imag_csv/{ri_name} and "
@@ -1484,6 +1537,7 @@ class MainApp(tk.Tk):
             self.proc_var.set("Processed: 0")
             self.buf_var.set("Buffer: 0")
             self.pkts_var.set("Packets: 0")
+            self.bw_var.set("")
             return
 
         if c.connected:
@@ -1498,6 +1552,15 @@ class MainApp(tk.Tk):
         self.proc_var.set(f"Processed: {c.total_processed}")
         self.buf_var.set(f"Buffer: {len(c.packet_buffer)}")
         self.pkts_var.set(f"Packets: {c.total_packets}")
+
+        mhz = getattr(c, "last_bfm_mhz", None)
+        if mhz is not None and mhz < FULL_BFM_MHZ:
+            self.bw_var.set(
+                f"⚠ BFM reports are {mhz} MHz, not {FULL_BFM_MHZ} MHz. "
+                f"Start Collection resets the router's rate first."
+            )
+        else:
+            self.bw_var.set("")
 
     def _init_doppler_artists(self):
         """Create the Doppler lines, reference lines and legends once."""
