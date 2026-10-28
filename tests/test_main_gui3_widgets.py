@@ -359,7 +359,8 @@ def test_live_plots_update_feature_panel(gui3_app):
     assert app.feat_max_var.get().startswith("Max Velocity: ")
     assert app.feat_std_var.get().startswith("Std Dev: ")
     assert app.feat_energy_var.get().startswith("Energy: ")
-    assert app.bfm_absvel_ax.get_xlabel() == "Packet Number"
+    assert app.bfm_vel_ax.get_xlabel() == "Packet Number"
+    assert app.bfm_motion_ax.get_xlabel() == "Time (s)"
 
 
 def test_live_plots_update_in_place_and_skip_unchanged(gui3_app, monkeypatch):
@@ -388,6 +389,12 @@ def test_live_plots_update_in_place_and_skip_unchanged(gui3_app, monkeypatch):
     assert app.bfm_vel_ax.get_xlim()[1] >= 58        # x-range follows the window
     assert len(app.bfm_vel_ax.collections) == 1      # old fill removed, not stacked
     assert len(app.bfm_vel_ax.get_lines()) == 2      # velocity + zero line only
+    # motion index: one point per packet once a full window exists, newest at t=0
+    motion_x = app._doppler_artists["motion"].get_xdata()
+    assert len(motion_x) == 60 - main_gui3.MOTION_WINDOW_PKTS
+    assert motion_x[-1] == 0.0 and motion_x[0] < 0
+    assert app.bfm_motion_ax.get_xlim() == (-main_gui3.MOTION_HISTORY_S, 0)
+    assert len(app.bfm_motion_ax.get_lines()) == 1    # no threshold line
 
 
 def test_streaming_tick_survives_bad_collector(gui3_app):
@@ -606,8 +613,9 @@ def test_start_pred_runs_once_and_stops(gui3_app, tmp_path, monkeypatch):
     app._start_pred()                      # second click must not spawn another
     assert app.pred_thread is first
 
-    assert pump_until(app, lambda: app.pred_label.cget("text").startswith("walking"))
+    assert pump_until(app, lambda: app.pred_label.cget("text") == "Walking")
     assert "P(walking)" in app.pred_prob_label.cget("text")
+    assert str(app.pred_label.cget("foreground")) == main_gui3.PRED_COLORS[1]
 
     app._stop_pred.set()
     assert pump_until(app, lambda: app.pred_label.cget("text") == "Waiting...")
@@ -622,3 +630,65 @@ def test_set_pred_text_marshals_to_main_thread(gui3_app):
     app.update()
     assert app.pred_label.cget("text") == "walking (0.91)"
     assert app.pred_prob_label.cget("text") == "raw 0.9"
+
+
+def test_pred_graphics_track_result_and_history(gui3_app):
+    app = gui3_app
+    app.bfm_rt_fs = 10.0
+    app.bfm_rt_cols = ([f"SCIDX_{i}_Ratio_Mag" for i in (-3, 1, 7)], [])
+    mag = np.log(np.random.default_rng(0).uniform(0.5, 2.0, (50, 3)))
+
+    app._update_pred_graphics(dict(smoothed=0.8, thresh=0.5, positive=True, mag=mag))
+    assert str(app.pred_label.cget("foreground")) == main_gui3.PRED_COLORS[1]
+    assert app.pred_person.find_all()                    # stick figure drawn
+    assert app._pred_artists["input"].get_array().shape == (3, 50)
+    assert app._pred_artists["input"].get_extent() == [-5.0, 0, -3, 7]
+    assert "last 5 s" in app.pred_input_ax.get_title()
+    assert len(app._pred_artists["fills"]) == 2          # replaced, not stacked
+    stride = app._pred_stride
+
+    app._update_pred_graphics(dict(smoothed=0.9, thresh=0.6, positive=True, mag=mag))
+    assert app._pred_stride != stride                    # walking pose alternates
+    assert list(app._pred_artists["thresh"].get_ydata()) == [0.6, 0.6]
+
+    app._update_pred_graphics(None)                      # status message: grey, gap in line
+    assert str(app.pred_label.cget("foreground")) == main_gui3.PRED_IDLE_COLOR
+    y = app._pred_artists["line"].get_ydata()
+    assert list(y[-3:-1]) == [0.8, 0.9] and np.isnan(y[-1])
+    assert len(app.pred_hist_ax.collections) == 2
+
+
+def test_pred_history_drops_old_points(gui3_app, monkeypatch):
+    app = gui3_app
+    app.bfm_rt_fs = 10.0
+    clock = [1000.0]
+    monkeypatch.setattr(main_gui3.time, "monotonic", lambda: clock[0])
+    app._pred_history.clear()                            # drop the construction-time entry
+    for _ in range(3):
+        app._update_pred_graphics(dict(smoothed=0.2, thresh=0.5, positive=False, mag=None))
+        clock[0] += main_gui3.PRED_HISTORY_S / 2 + 1
+    assert len(app._pred_history) == 2
+
+
+def test_relative_log_mag_drops_narrow_only_columns():
+    # column 1 exists only in one narrow-report row; row 2 is a narrow row
+    x = np.array([[1.0, np.nan, 3.0], [2.0, np.nan, 5.0], [np.nan, 9.0, np.nan], [3.0, np.nan, 4.0]])
+    rel, keep = main_gui3._relative_log_mag(x)
+    assert keep.tolist() == [True, False, True]
+    np.testing.assert_allclose(rel[[0, 1, 3], 0], [-1.0, 0.0, 1.0])
+    assert np.isnan(rel[2]).all()
+
+
+def test_motion_index_matches_window_mean_phase_step():
+    # subcarrier 0 turns 0.1 rad per packet, subcarrier 1 is still, subcarrier 2 turns 0.3
+    k = np.arange(8)[:, None]
+    z = np.exp(1j * k * np.array([0.1, 0.0, 0.3]))
+    np.testing.assert_allclose(main_gui3._motion_index(z, 4), [0.1] * 4)   # median of 0.1, 0, 0.3
+    assert main_gui3._motion_index(z, 8).size == 0                         # no full window yet
+
+
+def test_motion_index_ignores_narrow_only_subcarriers():
+    z = np.exp(1j * np.arange(6)[:, None] * np.array([0.2, 0.2, 0.0]))
+    z[:, 2] = np.nan
+    z[3, 2] = 1.0                       # only one narrow row carries subcarrier 2
+    np.testing.assert_allclose(main_gui3._motion_index(z, 3), [0.2] * 3)

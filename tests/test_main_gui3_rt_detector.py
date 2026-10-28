@@ -38,9 +38,11 @@ class Detector:
         self.pred_thresh = _Thresh(thresh)
         self._stop_pred = threading.Event()
         self.texts = []
+        self.results = []
 
-    def _set_pred_text(self, label, prob=""):
+    def _set_pred_text(self, label, prob="", result=None):
         self.texts.append((label, prob))
+        self.results.append(result)
 
 
 def _detector_with_rows(rows, **kw):
@@ -212,10 +214,15 @@ def test_prediction_loop_reports_walking_above_threshold():
     _run_loop(d)
 
     labels = [lbl for lbl, _ in d.texts[:-1]]
-    assert labels and all(l.startswith("walking (") for l in labels)
+    assert labels and all(l == "Walking" for l in labels)
     assert d.texts[-1] == ("Waiting...", "")
+    assert d.results[-1] is None
     # first prediction is unsmoothed p, later ones EMA toward p
-    assert d.texts[0][0] == "walking (0.90)"
+    first = d.results[0]
+    assert first["smoothed"] == pytest.approx(0.9) and first["positive"]
+    assert first["thresh"] == 0.5
+    assert first["mag"].shape == (20, len(DEFAULT_SCIDX))   # the window fed to the model
+    assert "90% confident" in d.texts[0][1]
     assert "threshold 0.50" in d.texts[0][1]
     assert model.seen[0].shape == (1, len(rtbfm.feature_names()))
 
@@ -223,20 +230,22 @@ def test_prediction_loop_reports_walking_above_threshold():
 def test_prediction_loop_reports_standing_below_threshold():
     d = _detector_with_rows(make_packet_rows(60), model=FakeModel(0.2), thresh=0.5)
     _run_loop(d)
-    assert all(lbl.startswith("standing (") for lbl, _ in d.texts[:-1])
+    assert all(lbl == "Standing" for lbl, _ in d.texts[:-1])
+    assert not any(r["positive"] for r in d.results[:-1])
+    assert "80% confident" in d.texts[0][1]   # confidence is in the shown class
 
 
 def test_prediction_loop_threshold_is_live():
     d = _detector_with_rows(make_packet_rows(60), model=FakeModel(0.6), thresh=0.7)
     _run_loop(d)
-    assert all(lbl.startswith("standing (") for lbl, _ in d.texts[:-1])
+    assert all(lbl == "Standing" for lbl, _ in d.texts[:-1])
 
 
 def test_prediction_loop_ema_converges():
     # Fresh loop starts at raw p; a steady stream must not drift away from it
     d = _detector_with_rows(make_packet_rows(60), model=FakeModel(0.8))
     _run_loop(d, min_texts=6)
-    smoothed = [float(lbl.split("(")[1].rstrip(")")) for lbl, _ in d.texts[:-1]]
+    smoothed = [r["smoothed"] for r in d.results[:-1]]
     assert all(abs(s - 0.8) < 1e-6 for s in smoothed)
 
 
@@ -244,6 +253,7 @@ def test_prediction_loop_shows_status_when_no_window():
     d = Detector(FakeCollector(running=False), model=FakeModel())
     _run_loop(d)
     assert d.texts[0] == ("BFM not streaming", "")
+    assert d.results[0] is None
     assert not d.bfm_rt_model.seen
 
 

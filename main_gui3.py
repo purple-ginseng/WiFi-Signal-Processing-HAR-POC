@@ -95,6 +95,15 @@ BFM_RT_MAX_GAP  = 0.15   # reject a window if >15% of its grid ticks had no pack
 BFM_RT_EMA      = 0.5    # causal EMA over the probability stream
 BFM_RT_STALE_S  = 5.0    # no new packet processed for this long -> report no live data
 
+# Real-time display
+PRED_HISTORY_S  = 60.0   # span of the probability history plot
+PRED_COLORS     = ("#27ae60", "#e67e22")   # class 0 (standing), class 1 (walking)
+PRED_IDLE_COLOR = "#9e9e9e"
+# Fixed so still and moving windows share one colour scale; 0.3 log units ≈ ±35%.
+CHANGE_HEATMAP_LIM = 0.3
+MOTION_WINDOW_PKTS = 50     # ≈ the detector's 5 s window at ~10 packets/s
+MOTION_HISTORY_S   = 60.0   # span of the collection tab's motion-index plot
+
 # Auto-detect tshark path based on platform
 if platform.system() == "Windows":
     TSHARK_PATH = r'C:\Program Files\Wireshark\tshark.exe'
@@ -139,6 +148,101 @@ def convert_real_imag_to_mag_phase(df, mag_cols, phase_cols):
     return append_mag_phase(df).drop(
         columns=col_dict["real_col"] + col_dict["imag_col"]
     )
+
+
+# ─── Live-display helpers ─────────────────────────────────────────────────────
+def _relative_log_mag(log_mag):
+    """(T, S) log-magnitude minus each subcarrier's window mean.
+
+    Columns that are mostly NaN (subcarriers only narrow reports carry) are
+    dropped; returns (relative, kept-column mask).
+    """
+    log_mag = np.asarray(log_mag, dtype=np.float64)
+    log_mag = np.where(np.isfinite(log_mag), log_mag, np.nan)
+    keep = np.isfinite(log_mag).mean(axis=0) > 0.5
+    log_mag = log_mag[:, keep]
+    return log_mag - np.nanmean(log_mag, axis=0, keepdims=True), keep
+
+
+def _motion_index(z, window):
+    """Median over subcarriers of mean |wrapped phase step| per trailing window.
+
+    The same quantity as rtbfm's phdiff_med, the deployed detector's strongest
+    feature. z is (packets, subcarriers) complex; one value per packet from
+    index `window` on.
+    """
+    z = z[:, np.isfinite(z).mean(axis=0) > 0.5]   # drop subcarriers only narrow reports carry
+    step = np.nan_to_num(np.abs(np.angle(z[1:] * np.conj(z[:-1]))))
+    if z.shape[1] == 0 or len(step) < window:
+        return np.empty(0)
+    c = np.vstack([np.zeros((1, step.shape[1])), np.cumsum(step, axis=0)])
+    return np.median((c[window:] - c[:-window]) / window, axis=1)
+
+
+def _change_heatmap(ax):
+    """Empty subcarrier-by-time image on ax, on the shared fixed colour scale."""
+    return ax.imshow(
+        np.zeros((1, 1)), aspect="auto", origin="lower", cmap="RdBu_r",
+        vmin=-CHANGE_HEATMAP_LIM, vmax=CHANGE_HEATMAP_LIM, interpolation="nearest",
+    )
+
+
+def _draw_person(canvas, pose, color):
+    """Stick figure on a Tk canvas: pose 0 standing, 1 and 2 the two strides."""
+    canvas.delete("all")
+    w = int(canvas.cget("width"))
+    h = int(canvas.cget("height"))
+    s = h / 200.0                       # figure is laid out on a 200-unit-high grid
+    cx = w / 2.0
+    lean = 0 if pose == 0 else 6        # walking leans slightly forward
+    flip = -1 if pose == 2 else 1       # second stride mirrors the first
+
+    def p(x, y):
+        return cx + x * s, y * s
+
+    def seg(*pts):
+        canvas.create_line(*[c for xy in pts for c in p(*xy)], fill=color,
+                           width=max(3, 6 * s), capstyle="round", joinstyle="round")
+
+    neck, hip, shoulder = (lean, 52), (0, 115), (lean * 0.8, 64)
+    if pose == 0:
+        arms = [((-24, 112),), ((24, 112),)]
+        legs = [((-6, 152), (-14, 188)), ((6, 152), (14, 188))]
+    else:
+        arms = [((-26 * flip, 92), (-30 * flip, 112)), ((20 * flip, 88), (34 * flip, 100))]
+        legs = [((16 * flip, 150), (30 * flip, 188)), ((-10 * flip, 152), (-32 * flip, 182))]
+
+    r = 15
+    hx, hy = p(lean * 1.2, 34)
+    canvas.create_oval(hx - r * s, hy - r * s, hx + r * s, hy + r * s,
+                       outline=color, width=max(3, 6 * s))
+    seg(neck, hip)
+    for arm in arms:
+        seg(shoulder, *arm)
+    for leg in legs:
+        seg(hip, *leg)
+    gx0, gy = p(-60, 192)
+    gx1, _ = p(60, 192)
+    canvas.create_line(gx0, gy, gx1, gy, fill="#cfcfcf", width=2)
+
+
+def _draw_gauge(canvas, p, thresh, color, left_label, right_label):
+    """Horizontal P(class 1) bar with the decision threshold marked."""
+    canvas.delete("all")
+    w = max(canvas.winfo_width(), 240)
+    pad, y0, y1 = 12, 22, 46
+    span = w - 2 * pad
+    canvas.create_rectangle(pad, y0, w - pad, y1, fill="#e6e6e6", outline="")
+    if p is not None:
+        canvas.create_rectangle(pad, y0, pad + span * p, y1, fill=color, outline="")
+    tx = pad + span * thresh
+    canvas.create_line(tx, y0 - 4, tx, y1 + 4, fill="#333333", width=2)
+    canvas.create_text(tx, y0 - 5, text=f"threshold {thresh:.2f}", anchor="s",
+                       fill="#333333", font=("Helvetica", 9))
+    canvas.create_text(pad, y1 + 7, text=left_label, anchor="nw",
+                       fill=PRED_COLORS[0], font=("Helvetica", 10, "bold"))
+    canvas.create_text(w - pad, y1 + 7, text=right_label, anchor="ne",
+                       fill=PRED_COLORS[1], font=("Helvetica", 10, "bold"))
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -1144,25 +1248,26 @@ class MainApp(tk.Tk):
         # so CSI-UDP mode's real-time plot keeps working unmodified.
         self.bfm_doppler_fig = Figure(figsize=(8, 3.8), tight_layout=True)
         self.bfm_vel_ax = self.bfm_doppler_fig.add_subplot(211)
-        self.bfm_absvel_ax = self.bfm_doppler_fig.add_subplot(212, sharex=self.bfm_vel_ax)
-        for _ax in (self.bfm_vel_ax, self.bfm_absvel_ax):
+        self.bfm_motion_ax = self.bfm_doppler_fig.add_subplot(212)
+        for _ax in (self.bfm_vel_ax, self.bfm_motion_ax):
             _ax.tick_params(labelsize=7)
             _ax.grid(True, alpha=0.3)
         self.bfm_vel_ax.set_title(
             "Doppler Velocity Time-Series", fontsize=9, fontweight="bold", pad=2
         )
         self.bfm_vel_ax.set_ylabel("Phase Velocity (rad/packet)", fontsize=8)
-        self.bfm_absvel_ax.set_title(
-            "Motion Magnitude (used for activity detection)",
+        self.bfm_vel_ax.set_xlabel("Packet Number", fontsize=8, labelpad=1)
+        self.bfm_motion_ax.set_title(
+            "Motion Index — median phase change per packet over 5 s (rises with movement)",
             fontsize=9,
             fontweight="bold",
             pad=2,
         )
-        self.bfm_absvel_ax.set_ylabel("|Velocity| (rad/packet)", fontsize=8)
-        self.bfm_absvel_ax.set_xlabel("Packet Number", fontsize=8)
+        self.bfm_motion_ax.set_ylabel("rad/packet", fontsize=8)
+        self.bfm_motion_ax.set_xlabel("Time (s)", fontsize=8)
+        self.bfm_motion_ax.set_xlim(-MOTION_HISTORY_S, 0)
         self.bfm_doppler_canvas = FigureCanvasTkAgg(self.bfm_doppler_fig, master=parent)
         self.bfm_doppler_canvas.get_tk_widget().pack(padx=10, pady=10, fill="both", expand=True)
-        self.WALK_THRESHOLD = 0.1  # rad/packet — same default as the Streamlit page
         self._doppler_artists = None  # built on first data by _init_doppler_artists
         self._doppler_drawn = None  # (buffer, generation) last drawn; unchanged means skip
 
@@ -1568,29 +1673,17 @@ class MainApp(tk.Tk):
             [], [], color="#e74c3c", linewidth=1.5, label="Mean Velocity"
         )
         self.bfm_vel_ax.axhline(0, color="k", linestyle="--", alpha=0.3)
-        absvel_line, = self.bfm_absvel_ax.plot(
-            [], [], color="#3498db", linewidth=1.5, label="Motion Magnitude"
-        )
-        self.bfm_absvel_ax.axhline(
-            self.WALK_THRESHOLD,
-            color="orange",
-            linestyle="--",
-            alpha=0.6,
-            label=f"Walking Threshold ({self.WALK_THRESHOLD:g})",
-        )
-        for ax in (self.bfm_vel_ax, self.bfm_absvel_ax):
-            ax.legend(loc="upper right", fontsize=7)
-        self._doppler_artists = {
-            "vel": vel_line, "absvel": absvel_line, "vel_fill": None, "absvel_fill": None,
-        }
+        self.bfm_vel_ax.legend(loc="upper right", fontsize=7)
+        motion_line, = self.bfm_motion_ax.plot([], [], color="#8e44ad", linewidth=1.5)
+        self._doppler_artists = {"vel": vel_line, "vel_fill": None, "motion": motion_line}
         return self._doppler_artists
 
     def _update_live_plots(self):
         """
         Pull the last N packets from the *processed* buffer (which has the
         complex Ratio_Real/Ratio_Imag columns), compute mean phase velocity
-        across subcarriers, and refresh the two Doppler subplots plus the
-        feature labels.
+        across subcarriers, and refresh the Doppler plot, the motion-index
+        history and the feature labels.
         """
         c = self.bfm_collector
         if c is None or len(c.processed_buffer) < 3:
@@ -1601,7 +1694,9 @@ class MainApp(tk.Tk):
         drawn = (id(c.processed_buffer), c.processed_buffer.generation)
         if drawn == self._doppler_drawn:
             return
-        df = c.processed_buffer.tail(N)
+        # Motion index needs the whole history span plus one window before it.
+        df_long = c.processed_buffer.tail(int(MOTION_HISTORY_S * 12) + MOTION_WINDOW_PKTS)
+        df = df_long.iloc[-N:]
         if len(df) < 3:
             return
         self._doppler_drawn = drawn
@@ -1623,9 +1718,10 @@ class MainApp(tk.Tk):
 
         real_cols = [real_map[i] for i in common_sc]
         imag_cols = [imag_map[i] for i in common_sc]
-        real_arr = df[real_cols].to_numpy(dtype=float)
-        imag_arr = df[imag_cols].to_numpy(dtype=float)
-        complex_matrix = real_arr + 1j * imag_arr  # (packets, subcarriers)
+        long_matrix = (df_long[real_cols].to_numpy(dtype=float)
+                       + 1j * df_long[imag_cols].to_numpy(dtype=float))
+        motion = _motion_index(long_matrix, MOTION_WINDOW_PKTS)
+        complex_matrix = long_matrix[-len(df):]  # (packets, subcarriers)
         complex_matrix = np.nan_to_num(complex_matrix, nan=0.0, posinf=0.0, neginf=0.0)
 
         # Phase velocity = unwrap(phase).diff() across packet axis
@@ -1641,25 +1737,33 @@ class MainApp(tk.Tk):
         # Update artists in place; clearing and rebuilding both axes cost ~130 ms per tick.
         art = self._doppler_artists or self._init_doppler_artists()
         art["vel"].set_data(x, mean_velocity)
-        art["absvel"].set_data(x, abs_velocity)
-        for key, ax, y, color in (
-            ("vel_fill", self.bfm_vel_ax, mean_velocity, "#e74c3c"),
-            ("absvel_fill", self.bfm_absvel_ax, abs_velocity, "#3498db"),
-        ):
-            if art[key] is not None:
-                art[key].remove()
-            art[key] = ax.fill_between(x, y, alpha=0.3, color=color)
+        if art["vel_fill"] is not None:
+            art["vel_fill"].remove()
+        art["vel_fill"] = self.bfm_vel_ax.fill_between(
+            x, mean_velocity, alpha=0.3, color="#e74c3c"
+        )
         self.bfm_vel_ax.set_title(
             f"Doppler Velocity Time-Series — last {len(df)} packets",
             fontsize=9,
             fontweight="bold",
             pad=2,
         )
-        # Rescale to the new window; include y=0 so the fills stay anchored.
-        for ax in (self.bfm_vel_ax, self.bfm_absvel_ax):
-            ax.relim()
-            ax.update_datalim([(0, 0)])
-            ax.autoscale_view()
+        # Rescale to the new window; include y=0 so the fill stays anchored.
+        self.bfm_vel_ax.relim()
+        self.bfm_vel_ax.update_datalim([(0, 0)])
+        self.bfm_vel_ax.autoscale_view()
+        self.bfm_vel_ax.set_xlim(-0.5, len(df) - 0.5)
+
+        # Motion index against seconds before the newest packet; y is not anchored at 0
+        ts = pd.to_numeric(df_long["timestamp"], errors="coerce").to_numpy(np.float64)
+        if len(motion) and np.isfinite(ts[-1]):
+            mt = ts[MOTION_WINDOW_PKTS:] - ts[-1]
+            art["motion"].set_data(mt, motion)
+            lo, hi = float(motion.min()), float(motion.max())
+            pad = max(0.15 * (hi - lo), 0.1 * hi, 1e-4)
+            self.bfm_motion_ax.set_ylim(max(0.0, lo - pad), hi + pad)
+        else:
+            art["motion"].set_data([], [])
 
         # The figure's tight_layout=True already re-lays out on every draw.
         self.bfm_doppler_canvas.draw_idle()
@@ -2194,14 +2298,60 @@ class MainApp(tk.Tk):
         # existing _streaming_tick refreshes this copy for free.
         ttk.Label(controls, textvariable=self.status_var).pack(side="left", padx=12)
 
-        self.pred_label = ttk.Label(parent, text="Waiting...", font=("Helvetica", 36))
-        self.pred_label.pack(pady=(40, 5))
-
-        self.pred_prob_label = ttk.Label(parent, text="", font=("Helvetica", 14))
-        self.pred_prob_label.pack()
-
         self.pred_model_label = ttk.Label(parent, text="No model loaded.", foreground="gray")
-        self.pred_model_label.pack(pady=(30, 0))
+        self.pred_model_label.pack(side="bottom", pady=(0, 8))
+
+        # Result card: stick figure | class name, probability line, gauge
+        card = ttk.Frame(parent)
+        card.pack(fill="x", padx=10, pady=(4, 0))
+        self.pred_person = tk.Canvas(card, width=150, height=170, highlightthickness=0,
+                                     bg=self.cget("bg"))
+        self.pred_person.pack(side="left", padx=(10, 20))
+        text_col = ttk.Frame(card)
+        text_col.pack(side="left", fill="x", expand=True)
+        self.pred_label = ttk.Label(text_col, text="Waiting...",
+                                    font=("Helvetica", 36, "bold"), foreground=PRED_IDLE_COLOR)
+        self.pred_label.pack(anchor="w")
+        self.pred_prob_label = ttk.Label(text_col, text="", font=("Helvetica", 12))
+        self.pred_prob_label.pack(anchor="w")
+        self.pred_gauge = tk.Canvas(text_col, height=70, highlightthickness=0,
+                                    bg=self.cget("bg"))
+        self.pred_gauge.pack(fill="x", pady=(10, 0), padx=(0, 10))
+
+        # Live plots: the model's input window, and the probability history
+        self.pred_fig = Figure(figsize=(8, 2.8), tight_layout=True)
+        gs = self.pred_fig.add_gridspec(1, 2, width_ratios=[1, 2.6])
+        self.pred_input_ax = self.pred_fig.add_subplot(gs[0, 0])
+        self.pred_hist_ax = self.pred_fig.add_subplot(gs[0, 1])
+        for ax in (self.pred_input_ax, self.pred_hist_ax):
+            ax.tick_params(labelsize=7)
+        self.pred_input_ax.set_title("Model input (waiting)", fontsize=9, fontweight="bold", pad=2)
+        self.pred_input_ax.set_xlabel("Time (s)", fontsize=8)
+        self.pred_input_ax.set_ylabel("Subcarrier", fontsize=8)
+        self.pred_hist_ax.set_title(f"Walking probability — last {PRED_HISTORY_S:g} s",
+                                    fontsize=9, fontweight="bold", pad=2)
+        self.pred_hist_ax.set_xlabel("Time (s)", fontsize=8)
+        self.pred_hist_ax.set_ylabel("P(walking)", fontsize=8)
+        self.pred_hist_ax.set_xlim(-PRED_HISTORY_S, 0)
+        self.pred_hist_ax.set_ylim(0, 1)
+        self.pred_hist_ax.grid(True, alpha=0.3)
+        self._pred_artists = {
+            "input": _change_heatmap(self.pred_input_ax),
+            "line": self.pred_hist_ax.plot([], [], color="#34495e", linewidth=1.5)[0],
+            "thresh": self.pred_hist_ax.axhline(
+                self.pred_thresh.get(), color="#333333", linestyle="--",
+                linewidth=1, label="decision threshold"),
+            "fills": [],
+        }
+        self.pred_hist_ax.legend(loc="upper left", fontsize=7)
+        self.pred_canvas = FigureCanvasTkAgg(self.pred_fig, master=parent)
+        self.pred_canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(6, 4))
+
+        self._pred_history = deque()   # (monotonic time, smoothed P or NaN)
+        self._pred_stride = 0          # alternates the walking pose per update
+        self._pred_last = None         # newest display result, for gauge redraws
+        self.pred_gauge.bind("<Configure>", lambda e: self._draw_pred_gauge())
+        self._update_pred_graphics(None)
 
     def _load_bfm_rt_model(self):
         """Load the first available bundle from BFM_MODEL_PATHS.
@@ -2232,6 +2382,11 @@ class MainApp(tk.Tk):
                     f"trained on {', '.join(self.bfm_rt_envs) or 'unknown'}")
             print(f"[INFO] BFM detector loaded: {desc}")
             self.pred_model_label.config(text=desc)
+            positive = self.bfm_rt_classes[1]
+            self.pred_hist_ax.set_ylabel(f"P({positive})", fontsize=8)
+            self.pred_hist_ax.set_title(
+                f"{positive.capitalize()} probability — last {PRED_HISTORY_S:g} s",
+                fontsize=9, fontweight="bold", pad=2)
             return True
 
         messagebox.showerror(
@@ -2320,15 +2475,88 @@ class MainApp(tk.Tk):
         phase = np.angle(np.exp(1j * raw_phase)).astype(np.float32)
         return mag, phase, gap
 
-    def _set_pred_text(self, label, prob=""):
-        """Update the prediction labels from the Tk main thread."""
+    def _set_pred_text(self, label, prob="", result=None):
+        """Update the prediction display from the Tk main thread.
+
+        result is None for status messages; for a prediction it is a dict with
+        smoothed, thresh, positive (bool) and mag (the model's input window).
+        """
         def apply():
             self.pred_label.config(text=label)
             self.pred_prob_label.config(text=prob)
+            self._update_pred_graphics(result)
         try:
             self.after(0, apply)
         except tk.TclError:
             pass   # window already destroyed
+
+    def _class_names(self):
+        names = getattr(self, "bfm_rt_classes", None) or ["standing", "walking"]
+        return names[0].capitalize(), names[1].capitalize()
+
+    def _draw_pred_gauge(self):
+        r = self._pred_last
+        left, right = self._class_names()
+        if r is None:
+            _draw_gauge(self.pred_gauge, None, self.pred_thresh.get(), PRED_IDLE_COLOR, left, right)
+        else:
+            _draw_gauge(self.pred_gauge, r["smoothed"], r["thresh"],
+                        PRED_COLORS[int(r["positive"])], left, right)
+
+    def _update_pred_graphics(self, result):
+        """Redraw figure, gauge and live plots; result as in _set_pred_text."""
+        self._pred_last = result
+        if result is None:
+            color, pose = PRED_IDLE_COLOR, 0
+        else:
+            color = PRED_COLORS[int(result["positive"])]
+            if result["positive"]:
+                self._pred_stride = 2 if self._pred_stride == 1 else 1
+                pose = self._pred_stride
+            else:
+                pose = 0
+        self.pred_label.config(foreground=color)
+        _draw_person(self.pred_person, pose, color)
+        self._draw_pred_gauge()
+
+        # Probability history; NaN breaks the line while no prediction is available
+        now = time.monotonic()
+        hist = self._pred_history
+        hist.append((now, np.nan if result is None else result["smoothed"]))
+        while hist and now - hist[0][0] > PRED_HISTORY_S:
+            hist.popleft()
+        if not any(np.isfinite(p) for _, p in hist) and len(hist) > 1:
+            return   # nothing new to plot; skip the redraw while idle
+        x = np.array([t - now for t, _ in hist])
+        y = np.array([p for _, p in hist])
+        art = self._pred_artists
+        art["line"].set_data(x, y)
+        thresh = self.pred_thresh.get() if result is None else result["thresh"]
+        art["thresh"].set_ydata([thresh, thresh])
+        for f in art["fills"]:
+            f.remove()
+        ax = self.pred_hist_ax
+        # Background bands show the predicted class over time; blank where there was none
+        above = np.nan_to_num(y, nan=-1.0) >= thresh
+        below = ~above & np.isfinite(y)
+        art["fills"] = [
+            ax.fill_between(x, 0, 1, where=mask, color=c, alpha=0.25, step="mid", linewidth=0)
+            for mask, c in ((above, PRED_COLORS[1]), (below, PRED_COLORS[0]))
+        ]
+
+        if result is not None and result.get("mag") is not None:
+            rel, keep = _relative_log_mag(result["mag"])
+            if rel.shape[1]:
+                window_s = rel.shape[0] / self.bfm_rt_fs
+                sc = [int(c.split("_")[1]) for c in self.bfm_rt_cols[0]]
+                sc = np.asarray(sc)[keep] if len(sc) == len(keep) else np.arange(rel.shape[1])
+                art["input"].set_data(rel.T)
+                art["input"].set_extent((-window_s, 0, sc[0], sc[-1]))
+                self.pred_input_ax.set_xlim(-window_s, 0)
+                self.pred_input_ax.set_ylim(sc[0], sc[-1])
+                self.pred_input_ax.set_title(f"Model input: last {window_s:g} s",
+                                             fontsize=9, fontweight="bold", pad=2)
+        self.pred_canvas.draw_idle()
 
     def _start_pred(self):
         if getattr(self, "bfm_rt_model", None) is None:
@@ -2343,6 +2571,7 @@ class MainApp(tk.Tk):
         if getattr(self, "pred_thread", None) is not None and self.pred_thread.is_alive():
             return   # already running; a second thread would just fight over the label
         self._stop_pred.clear()
+        self._pred_history.clear()
         self.pred_thread = threading.Thread(target=self._prediction_loop, daemon=True)
         self.pred_thread.start()
 
@@ -2373,11 +2602,14 @@ class MainApp(tk.Tk):
                         smoothed = p if smoothed is None else BFM_RT_EMA * p + (1 - BFM_RT_EMA) * smoothed
 
                         thresh = self.pred_thresh.get()
-                        label = walking if smoothed >= thresh else standing
+                        positive = smoothed >= thresh
+                        label = walking if positive else standing
+                        confidence = smoothed if positive else 1.0 - smoothed
                         self._set_pred_text(
-                            f"{label} ({smoothed:.2f})",
-                            f"P({walking}) = {p:.2f} raw / {smoothed:.2f} smoothed"
-                            f"   ·   threshold {thresh:.2f}")
+                            label.capitalize(),
+                            f"{confidence:.0%} confident   ·   P({walking}) = {p:.2f} raw"
+                            f" / {smoothed:.2f} smoothed   ·   threshold {thresh:.2f}",
+                            dict(smoothed=smoothed, thresh=thresh, positive=positive, mag=mag))
             except Exception as e:
                 print("Prediction error:", e)
             time.sleep(max(0.0, hop - (time.perf_counter() - tick)))

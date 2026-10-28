@@ -27,6 +27,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='matplotlib')
 
 DATA_DIR = "./bfm_real_imag_csv"
 SUBCARRIER_PATTERN = re.compile(r"SCIDX_(-?\d+)_Ratio_(Real|Imag)", re.IGNORECASE)
+SESSION_TS_PATTERN = re.compile(r"_(\d{8}_\d{6})\.csv$")
 CMAPS = ["turbo", "viridis", "jet", "plasma", "inferno", "magma", "cividis", "RdYlBu_r", "twilight", "hsv"]
 
 
@@ -40,8 +41,14 @@ def request_rerun() -> None:
 
 
 def get_available_files(directory: str) -> list[str]:
-    files = sorted(glob.glob(os.path.join(directory, "*.csv")))
-    return files
+    """CSV paths, newest session first (by the _YYYYMMDD_HHMMSS name suffix, else mtime)."""
+    def session_time(path: str) -> str:
+        m = SESSION_TS_PATTERN.search(os.path.basename(path))
+        if m:
+            return m.group(1)
+        return time.strftime("%Y%m%d_%H%M%S", time.localtime(os.path.getmtime(path)))
+
+    return sorted(glob.glob(os.path.join(directory, "*.csv")), key=session_time, reverse=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -69,8 +76,11 @@ def collect_subcarrier_columns(columns: pd.Index) -> tuple[list[int], dict[int, 
 
 
 @lru_cache(maxsize=16)
-def build_complex_matrix(cache_key: tuple[str, int]) -> tuple[np.ndarray, np.ndarray]:
-    """Cache heavy conversion using file path and an optional downsample step."""
+def build_complex_matrix(cache_key: tuple[str, int]) -> tuple[np.ndarray, np.ndarray, list[int]]:
+    """Cache heavy conversion using file path and an optional downsample step.
+
+    Returns (complex matrix, timestamps, subcarrier ids of its columns).
+    """
     path, downsample = cache_key
     df = load_bfm_dataframe(path)
     subcarrier_ids, mapping = collect_subcarrier_columns(df.columns)
@@ -79,8 +89,20 @@ def build_complex_matrix(cache_key: tuple[str, int]) -> tuple[np.ndarray, np.nda
 
     real_cols = [mapping[idx]["real"] for idx in subcarrier_ids]
     imag_cols = [mapping[idx]["imag"] for idx in subcarrier_ids]
-    df_real = df[real_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    df_imag = df[imag_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    df_real = df[real_cols].apply(pd.to_numeric, errors="coerce")
+    df_imag = df[imag_cols].apply(pd.to_numeric, errors="coerce")
+
+    # Mixed-width sessions: drop subcarriers only narrow (20/40 MHz) reports carry, then those narrow rows.
+    present = df_real.notna().to_numpy() & df_imag.notna().to_numpy()   # arrays: Real/Imag labels differ
+    keep_cols = present.mean(axis=0) > 0.5
+    keep_rows = present[:, keep_cols].all(axis=1)
+    if keep_cols.any() and keep_rows.any():
+        df_real = df_real.loc[keep_rows, keep_cols].reset_index(drop=True)
+        df_imag = df_imag.loc[keep_rows, keep_cols].reset_index(drop=True)
+        df = df.loc[keep_rows].reset_index(drop=True)
+        subcarrier_ids = [idx for idx, k in zip(subcarrier_ids, keep_cols) if k]
+    df_real = df_real.fillna(0.0)
+    df_imag = df_imag.fillna(0.0)
 
     if downsample > 1:
         df_real = df_real.iloc[::downsample].reset_index(drop=True)
@@ -99,7 +121,7 @@ def build_complex_matrix(cache_key: tuple[str, int]) -> tuple[np.ndarray, np.nda
     if timestamps is not None:
         timestamps = timestamps.to_numpy(dtype=np.float64)
 
-    return complex_matrix, timestamps
+    return complex_matrix, timestamps, subcarrier_ids
 
 
 def compute_summary_stats(complex_matrix: np.ndarray) -> dict[str, float]:
@@ -833,18 +855,11 @@ def main() -> None:
         st.error(f"No CSV files found under `{DATA_DIR}`.")
         st.stop()
 
-    # Set default file for realtime activity testing
-    default_file = "bfm_data_pg_standing_home_20251027_211523.csv"
-    default_index = 0
-    for i, f in enumerate(files):
-        if default_file in f:
-            default_index = i
-            break
-
+    # Newest session first, so the latest capture is the default
     selected_file = st.sidebar.selectbox(
         "Select Beamforming Capture",
         files,
-        index=default_index,
+        index=0,
         format_func=os.path.basename,
     )
 
@@ -859,15 +874,14 @@ def main() -> None:
         state["bfm_window_size"] = 250
 
     df = load_bfm_dataframe(selected_file)
-    subcarrier_values, _ = collect_subcarrier_columns(df.columns)
-    if not subcarrier_values:
+    if not collect_subcarrier_columns(df.columns)[0]:
         st.error("No SCIDX_* ratio columns found in the selected file.")
         st.stop()
 
     st.sidebar.markdown("### Pre-processing")
     downsample = st.sidebar.slider("Downsample factor", min_value=1, max_value=10, value=1, help="Keeps every Nth sample.")
 
-    complex_matrix, timestamps = build_complex_matrix((selected_file, downsample))
+    complex_matrix, timestamps, subcarrier_values = build_complex_matrix((selected_file, downsample))
     num_samples, num_subcarriers = complex_matrix.shape
     time_axis = np.arange(num_samples, dtype=float) if timestamps is None else (timestamps - timestamps[0]).astype(float)
 
