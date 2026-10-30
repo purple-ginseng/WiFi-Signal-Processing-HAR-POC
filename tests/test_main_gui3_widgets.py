@@ -49,6 +49,10 @@ def test_widget_group_add_copies_current_state(gui3_app):
     assert str(extra.cget("state")) == "disabled"
 
 
+def test_threshold_defaults_to_debounced_detector_setting(gui3_app):
+    assert gui3_app.pred_thresh.get() == main_gui3.BFM_RT_THRESH == 0.7
+
+
 def test_threshold_label_tracks_slider(gui3_app):
     gui3_app.pred_thresh.set(0.73)
     assert gui3_app.thresh_value_label.cget("text") == "0.73"
@@ -535,6 +539,7 @@ def test_on_close_tears_down_partial_collector(gui3_app):
     assert fake.calls == ["stop_collection"]
     assert app._stop_csi.is_set()
     assert app._stop_pcap_transfer.is_set()
+    assert app._stop_pred.is_set()          # detector thread stops before widgets go away
 
 
 # ─── Detector model loading / start ────────────────────────────────────────────
@@ -604,6 +609,7 @@ def test_start_pred_without_model_stops_early(gui3_app, monkeypatch, dialogs):
 def test_start_pred_runs_once_and_stops(gui3_app, tmp_path, monkeypatch):
     app = gui3_app
     monkeypatch.setattr(main_gui3, "BFM_MODEL_PATHS", [_bundle_file(tmp_path, hop_s=0.02)])
+    monkeypatch.setattr(main_gui3, "BFM_RT_ENTER_S", 0.0)
     fake = FakeCollector()
     fake.packet_buffer.append(make_packet_frame(80))
     app.bfm_collector = fake
@@ -644,7 +650,7 @@ def test_pred_graphics_track_result_and_history(gui3_app):
     assert app._pred_artists["input"].get_array().shape == (3, 50)
     assert app._pred_artists["input"].get_extent() == [-5.0, 0, -3, 7]
     assert "last 5 s" in app.pred_input_ax.get_title()
-    assert len(app._pred_artists["fills"]) == 2          # replaced, not stacked
+    assert len(app._pred_artists["fills"]) == 1          # one walking band so far
     stride = app._pred_stride
 
     app._update_pred_graphics(dict(smoothed=0.9, thresh=0.6, positive=True, mag=mag))
@@ -655,7 +661,14 @@ def test_pred_graphics_track_result_and_history(gui3_app):
     assert str(app.pred_label.cget("foreground")) == main_gui3.PRED_IDLE_COLOR
     y = app._pred_artists["line"].get_ydata()
     assert list(y[-3:-1]) == [0.8, 0.9] and np.isnan(y[-1])
-    assert len(app.pred_hist_ax.collections) == 2
+    assert len(app.pred_hist_ax.patches) == 1           # bands replaced, not stacked
+
+    # Standing after walking: two bands that meet with no gap between them
+    app._update_pred_graphics(dict(smoothed=0.1, thresh=0.6, positive=False, mag=None))
+    walk, stand = app._pred_artists["fills"]
+    assert walk.get_facecolor()[:3] == main_gui3.matplotlib.colors.to_rgb(main_gui3.PRED_COLORS[1])
+    assert stand.get_facecolor()[:3] == main_gui3.matplotlib.colors.to_rgb(main_gui3.PRED_COLORS[0])
+    assert stand.get_x() > walk.get_x() + walk.get_width()   # the status sample sits between them
 
 
 def test_pred_history_drops_old_points(gui3_app, monkeypatch):

@@ -197,6 +197,25 @@ def test_deployed_bundle_matches_rtbfm_features(path):
 
 
 # ─── _prediction_loop ──────────────────────────────────────────────────────────
+@pytest.fixture(autouse=True)
+def no_debounce(monkeypatch):
+    """Label follows the smoothed P at once; debounce tests turn the hold back on."""
+    monkeypatch.setattr(main_gui3, "BFM_RT_ENTER_S", 0.0)
+    monkeypatch.setattr(main_gui3, "BFM_RT_EXIT_S", 0.0)
+
+
+class SeqModel(FakeModel):
+    """FakeModel whose P(walking) follows a script, repeating the last value."""
+
+    def __init__(self, ps):
+        super().__init__()
+        self.ps = list(ps)
+
+    def predict_proba(self, X):
+        self.p_walk = self.ps[min(len(self.seen), len(self.ps) - 1)]
+        return super().predict_proba(X)
+
+
 def _run_loop(d, min_texts=3, timeout=5.0):
     t = threading.Thread(target=d._prediction_loop, daemon=True)
     t.start()
@@ -273,3 +292,54 @@ def test_prediction_loop_survives_model_error(capsys):
     _run_loop(d, min_texts=1, timeout=1.0)
     assert "Prediction error: boom" in capsys.readouterr().out
     assert d.texts[-1] == ("Waiting...", "")
+
+
+def test_prediction_loop_waits_before_switching_to_walking(monkeypatch):
+    monkeypatch.setattr(main_gui3, "BFM_RT_ENTER_S", 0.1)   # 5 hops of 0.02 s
+    d = _detector_with_rows(make_packet_rows(60), model=FakeModel(0.9), thresh=0.7)
+    _run_loop(d, min_texts=8)
+    labels = [lbl for lbl, _ in d.texts[:-1]]
+    assert labels[:4] == ["Standing"] * 4                  # above threshold, still held
+    assert set(labels[4:]) == {"Walking"}
+
+
+def test_prediction_loop_brief_spike_never_shows_walking(monkeypatch):
+    monkeypatch.setattr(main_gui3, "BFM_RT_ENTER_S", 0.1)
+    # EMA 0.5: 0.9, 0.9 -> smoothed 0.45, 0.67, 0.78 ... then back down
+    d = _detector_with_rows(make_packet_rows(60), model=SeqModel([0.0, 0.9, 0.9, 0.9, 0.0]), thresh=0.7)
+    _run_loop(d, min_texts=10)
+    assert {lbl for lbl, _ in d.texts[:-1]} == {"Standing"}
+    assert not any(r["positive"] for r in d.results[:-1])
+
+
+def test_prediction_loop_holds_walking_before_switching_back(monkeypatch):
+    monkeypatch.setattr(main_gui3, "BFM_RT_EXIT_S", 0.06)   # 3 hops
+    d = _detector_with_rows(make_packet_rows(60), model=SeqModel([0.9] * 4 + [0.0]), thresh=0.7)
+    _run_loop(d, min_texts=10)
+    labels = [lbl for lbl, _ in d.texts[:-1]]
+    # smoothed P drops below 0.7 on hop 5; label holds on hops 5-6, flips on hop 7
+    assert labels[:6] == ["Walking"] * 6
+    assert set(labels[6:]) == {"Standing"}
+
+
+def test_prediction_loop_status_resets_debounce(monkeypatch):
+    monkeypatch.setattr(main_gui3, "BFM_RT_EXIT_S", 10.0)   # would hold walking for 500 hops
+    c = FakeCollector()
+    c.packet_buffer.append(pd.DataFrame(make_packet_rows(60)))
+    d = Detector(c, model=FakeModel(0.9), thresh=0.7)
+    _run_loop(d, min_texts=3)
+    assert d.texts[0][0] == "Walking"
+
+    c.running = False                         # stream lost: status message, state cleared
+    d.bfm_rt_model.p_walk = 0.0
+    d._stop_pred.clear(); d.texts.clear(); d.results.clear()
+    t = threading.Thread(target=d._prediction_loop, daemon=True); t.start()
+    deadline = time.time() + 5
+    while not d.texts and time.time() < deadline:
+        time.sleep(0.01)
+    c.running = True
+    while len(d.texts) < 4 and time.time() < deadline:
+        time.sleep(0.01)
+    d._stop_pred.set(); t.join(timeout=5)
+    first_pred = next(lbl for lbl, _ in d.texts if lbl in ("Walking", "Standing"))
+    assert first_pred == "Standing"

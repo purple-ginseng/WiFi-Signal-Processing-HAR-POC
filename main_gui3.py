@@ -93,6 +93,11 @@ BFM_VERBOSE   = False
 BFM_MODEL_PATHS = ['bfm_rt_model_5s_xgb.joblib', 'bfm_rt_model_nofoil_xgb.joblib', 'bfm_rt_model_nofoil.joblib']
 BFM_RT_MAX_GAP  = 0.15   # reject a window if >15% of its grid ticks had no packet nearby
 BFM_RT_EMA      = 0.5    # causal EMA over the probability stream
+# Debounce: smoothed P must stay on one side of the threshold this long before the label flips.
+# Walking shows at once (a 3 s wait missed real walking in live tests); it is held through brief dips.
+BFM_RT_THRESH   = 0.7    # default decision threshold (Prediction Threshold slider)
+BFM_RT_ENTER_S  = 0.0    # seconds at/above threshold before showing the positive class
+BFM_RT_EXIT_S   = 2.0    # seconds below threshold before switching back
 BFM_RT_STALE_S  = 5.0    # no new packet processed for this long -> report no live data
 
 # Real-time display
@@ -188,39 +193,53 @@ def _change_heatmap(ax):
 
 
 def _draw_person(canvas, pose, color):
-    """Stick figure on a Tk canvas: pose 0 standing, 1 and 2 the two strides."""
+    """Stick figure on a Tk canvas: pose 0 standing (front view), 1 and 2 walking.
+
+    Walking is a side view facing right; the two strides swap which leg and
+    arm are in front, drawn darker, instead of mirroring the whole figure.
+    """
     canvas.delete("all")
     w = int(canvas.cget("width"))
     h = int(canvas.cget("height"))
     s = h / 200.0                       # figure is laid out on a 200-unit-high grid
     cx = w / 2.0
-    lean = 0 if pose == 0 else 6        # walking leans slightly forward
-    flip = -1 if pose == 2 else 1       # second stride mirrors the first
+    width = max(3, 6 * s)
 
     def p(x, y):
         return cx + x * s, y * s
 
-    def seg(*pts):
-        canvas.create_line(*[c for xy in pts for c in p(*xy)], fill=color,
-                           width=max(3, 6 * s), capstyle="round", joinstyle="round")
+    def seg(pts, fill):
+        canvas.create_line(*[c for xy in pts for c in p(*xy)], fill=fill, width=width,
+                           capstyle="round", joinstyle="round")
 
-    neck, hip, shoulder = (lean, 52), (0, 115), (lean * 0.8, 64)
     if pose == 0:
-        arms = [((-24, 112),), ((24, 112),)]
-        legs = [((-6, 152), (-14, 188)), ((6, 152), (14, 188))]
+        head, neck, hip, shoulder = (0, 34), (0, 52), (0, 115), (0, 64)
+        limbs = [((shoulder, (-24, 112)), color), ((shoulder, (24, 112)), color),
+                 ((hip, (-6, 152), (-14, 188)), color), ((hip, (6, 152), (14, 188)), color)]
     else:
-        arms = [((-26 * flip, 92), (-30 * flip, 112)), ((20 * flip, 88), (34 * flip, 100))]
-        legs = [((16 * flip, 150), (30 * flip, 188)), ((-10 * flip, 152), (-32 * flip, 182))]
+        # Far-side limbs: halfway between the class colour and the canvas background
+        rgb = [(a + b) // 512 for a, b in zip(canvas.winfo_rgb(color),
+                                              canvas.winfo_rgb(canvas.cget("bg")))]
+        far = "#%02x%02x%02x" % tuple(rgb)
+        head, neck, hip, shoulder = (10, 34), (7, 52), (0, 115), (6, 64)
+        leg_fwd = (hip, (14, 150), (26, 184), (36, 186))       # heel strike, toes ahead
+        leg_back = (hip, (-8, 152), (-26, 178), (-18, 187))    # pushing off the back toe
+        arm_fwd = (shoulder, (18, 88), (30, 104))
+        arm_back = (shoulder, (-8, 90), (-14, 112))
+        # Each arm swings opposite its own-side leg; far limbs first so near ones overlap them
+        if pose == 1:
+            limbs = [(leg_back, far), (arm_fwd, far), (leg_fwd, color), (arm_back, color)]
+        else:
+            limbs = [(leg_fwd, far), (arm_back, far), (leg_back, color), (arm_fwd, color)]
 
+    for pts, fill in limbs[:2]:
+        seg(pts, fill)
     r = 15
-    hx, hy = p(lean * 1.2, 34)
-    canvas.create_oval(hx - r * s, hy - r * s, hx + r * s, hy + r * s,
-                       outline=color, width=max(3, 6 * s))
-    seg(neck, hip)
-    for arm in arms:
-        seg(shoulder, *arm)
-    for leg in legs:
-        seg(hip, *leg)
+    hx, hy = p(*head)
+    canvas.create_oval(hx - r * s, hy - r * s, hx + r * s, hy + r * s, outline=color, width=width)
+    seg((neck, hip), color)
+    for pts, fill in limbs[2:]:
+        seg(pts, fill)
     gx0, gy = p(-60, 192)
     gx1, _ = p(60, 192)
     canvas.create_line(gx0, gy, gx1, gy, fill="#cfcfcf", width=2)
@@ -1040,7 +1059,7 @@ class MainApp(tk.Tk):
         self.geometry("1000x800")
 
         self.chunk_size = tk.IntVar(value=128)
-        self.pred_thresh = tk.DoubleVar(value=0.5)
+        self.pred_thresh = tk.DoubleVar(value=BFM_RT_THRESH)
         self.pca = None
         self.label_encoder = None
         self.model = None
@@ -1060,6 +1079,7 @@ class MainApp(tk.Tk):
         self.bfm_collector = None
 
     def _on_close(self):
+        self._stop_pred.set()   # otherwise the detector thread keeps updating destroyed widgets
         self._stop_csi.set()
         self._stop_pcap_transfer_loop()
 
@@ -2347,7 +2367,7 @@ class MainApp(tk.Tk):
         self.pred_canvas = FigureCanvasTkAgg(self.pred_fig, master=parent)
         self.pred_canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(6, 4))
 
-        self._pred_history = deque()   # (monotonic time, smoothed P or NaN)
+        self._pred_history = deque()   # (monotonic time, smoothed P or NaN, shown class 1?)
         self._pred_stride = 0          # alternates the walking pose per update
         self._pred_last = None         # newest display result, for gauge redraws
         self.pred_gauge.bind("<Configure>", lambda e: self._draw_pred_gauge())
@@ -2522,13 +2542,17 @@ class MainApp(tk.Tk):
         # Probability history; NaN breaks the line while no prediction is available
         now = time.monotonic()
         hist = self._pred_history
-        hist.append((now, np.nan if result is None else result["smoothed"]))
+        if result is None:
+            hist.append((now, np.nan, False))
+        else:
+            hist.append((now, result["smoothed"], bool(result["positive"])))
         while hist and now - hist[0][0] > PRED_HISTORY_S:
             hist.popleft()
-        if not any(np.isfinite(p) for _, p in hist) and len(hist) > 1:
+        if not any(np.isfinite(p) for _, p, _ in hist) and len(hist) > 1:
             return   # nothing new to plot; skip the redraw while idle
-        x = np.array([t - now for t, _ in hist])
-        y = np.array([p for _, p in hist])
+        x = np.array([t - now for t, _, _ in hist])
+        y = np.array([p for _, p, _ in hist])
+        shown = np.array([c for _, _, c in hist])
         art = self._pred_artists
         art["line"].set_data(x, y)
         thresh = self.pred_thresh.get() if result is None else result["thresh"]
@@ -2536,12 +2560,14 @@ class MainApp(tk.Tk):
         for f in art["fills"]:
             f.remove()
         ax = self.pred_hist_ax
-        # Background bands show the predicted class over time; blank where there was none
-        above = np.nan_to_num(y, nan=-1.0) >= thresh
-        below = ~above & np.isfinite(y)
+        # Background bands show the shown class over time; sample i spans [x_i, x_i+1), blank if none
+        state = np.where(np.isfinite(y), shown.astype(int), -1)
+        edges = np.r_[x, 0.0]
+        starts = np.flatnonzero(np.r_[True, state[1:] != state[:-1]])
+        ends = np.r_[starts[1:], len(state)]
         art["fills"] = [
-            ax.fill_between(x, 0, 1, where=mask, color=c, alpha=0.25, step="mid", linewidth=0)
-            for mask, c in ((above, PRED_COLORS[1]), (below, PRED_COLORS[0]))
+            ax.axvspan(edges[i], edges[j], color=PRED_COLORS[state[i]], alpha=0.25, linewidth=0)
+            for i, j in zip(starts, ends) if state[i] >= 0
         ]
 
         if result is not None and result.get("mag") is not None:
@@ -2576,10 +2602,13 @@ class MainApp(tk.Tk):
         self.pred_thread.start()
 
     def _prediction_loop(self):
-        """One prediction per hop, EMA-smoothed, until Stop is pressed."""
+        """One prediction per hop, EMA-smoothed and debounced, until Stop is pressed."""
         fs, hop = self.bfm_rt_fs, self.bfm_rt_hop_s
         standing, walking = self.bfm_rt_classes[0], self.bfm_rt_classes[1]
+        need_in = max(1, round(BFM_RT_ENTER_S / hop))
+        need_out = max(1, round(BFM_RT_EXIT_S / hop))
         smoothed = None
+        positive, streak = False, 0   # shown class, and hops the smoothed P has disagreed with it
 
         while not self._stop_pred.is_set():
             tick = time.perf_counter()
@@ -2590,6 +2619,7 @@ class MainApp(tk.Tk):
                     # resumed stream doesn't start from a stale probability
                     self._set_pred_text(window)
                     smoothed = None
+                    positive, streak = False, 0
                 else:
                     mag, phase, gap = window
                     if gap.mean() > BFM_RT_MAX_GAP:
@@ -2602,7 +2632,9 @@ class MainApp(tk.Tk):
                         smoothed = p if smoothed is None else BFM_RT_EMA * p + (1 - BFM_RT_EMA) * smoothed
 
                         thresh = self.pred_thresh.get()
-                        positive = smoothed >= thresh
+                        streak = streak + 1 if (smoothed >= thresh) != positive else 0
+                        if streak >= (need_out if positive else need_in):
+                            positive, streak = not positive, 0
                         label = walking if positive else standing
                         confidence = smoothed if positive else 1.0 - smoothed
                         self._set_pred_text(
