@@ -1,6 +1,7 @@
 """main_gui.MainApp on a real Tk window, router faked. Needs a display."""
 import io
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -8,7 +9,7 @@ import pandas as pd
 import pytest
 
 import main_gui
-from conftest import make_ratio_frame, run_until
+from conftest import make_ratio_frame, pump_until, run_until
 
 pytestmark = pytest.mark.gui
 
@@ -219,6 +220,83 @@ def test_bfm_collection_no_pcaps_reports_orange(gui_app, fake_bfmtool):
     assert "No pcap files were captured" in app.collect_msg.cget("text")
     assert str(app.collect_msg.cget("foreground")) == "orange"
     assert fake_bfmtool["collector"].calls[-1] == "stop_pcap_collection"
+
+
+def _stop_session(app, monkeypatch, keep, duration=30):
+    """Run a session on a worker, click Stop once recording; returns dialog calls."""
+    asked = []
+    monkeypatch.setattr(main_gui.messagebox, "askyesno",
+                        lambda *a, **k: asked.append((a, k)) or keep)
+    worker = threading.Thread(target=app._do_bfm_collection,
+                              args=("alice", "walking", "", duration), daemon=True)
+
+    def click():
+        if str(app.collect_stop_btn.cget("state")) == "normal":
+            app.collect_stop_btn.invoke()
+        else:
+            app.after(20, click)
+
+    # Started inside the main loop, as Start Collection does in the real app.
+    app.after(0, worker.start)
+    app.after(300, click)
+    assert pump_until(app, lambda: worker.ident is not None and not worker.is_alive(),
+                      timeout=15)
+    return asked
+
+
+def test_stop_and_delete_removes_only_this_sessions_pcaps(gui_app, fake_bfmtool, tmp_path,
+                                                          monkeypatch):
+    app = gui_app
+    app._toggle_bfm_setup()
+    c = fake_bfmtool["collector"]
+    app._extract_bfm_for_plot = lambda p: []
+    (tmp_path / "bfm_pcap").mkdir()
+    earlier = tmp_path / "bfm_pcap" / "earlier_session.pcap"
+    current = tmp_path / "bfm_pcap" / "this_session.pcap"
+    earlier.write_bytes(b"keep")
+    current.write_bytes(b"drop")
+    app.bfm_collected = {earlier}
+    c.collected = {earlier, current}
+
+    start = time.time()
+    asked = _stop_session(app, monkeypatch, keep=False)
+
+    assert time.time() - start < 10 and len(asked) == 1
+    assert earlier.exists() and not current.exists()
+    assert fake_bfmtool["extractor"].extracted == set()
+    assert not (tmp_path / "bfm_real_imag_csv").exists()
+    assert app.collect_msg.cget("text") == "[BFM] Session deleted: nothing was saved."
+    assert c.calls[-1] == "stop_pcap_collection"
+    assert app.bfm_collected == {earlier, current}   # the next session must not retry it
+    assert str(app.collect_stop_btn.cget("state")) == "disabled"
+    assert str(app.collect_btn.cget("state")) == "normal"
+
+
+def test_stop_and_save_keeps_only_what_was_recorded(gui_app, fake_bfmtool, tmp_path, monkeypatch):
+    app = gui_app
+    app._toggle_bfm_setup()
+    c = fake_bfmtool["collector"]
+    app._extract_bfm_for_plot = lambda p: []
+    start = time.time()
+    # 200 rows over 10 s: most fall after Stop and must be trimmed away.
+    fake_bfmtool["preprocessor"].frame_factory = lambda: make_ratio_frame(200, t0=start, fs=20.0)
+    c.collected = {Path("bfm_pcap") / "chunk0.pcap"}
+
+    _stop_session(app, monkeypatch, keep=True)
+
+    ri = list((tmp_path / "bfm_real_imag_csv").glob("*.csv"))
+    assert len(ri) == 1
+    assert 0 < len(pd.read_csv(ri[0])) < 100
+
+
+def test_stop_after_the_timer_ended_does_nothing(gui_app, fake_bfmtool, monkeypatch):
+    app = gui_app
+    app._toggle_bfm_setup()
+    app._extract_bfm_for_plot = lambda p: []
+    app._do_bfm_collection("alice", "walking", "", 1)
+    monkeypatch.setattr(main_gui.messagebox, "askyesno",
+                        lambda *a, **k: pytest.fail("no session to stop"))
+    app._on_stop_collection()
 
 
 def test_bfm_collection_saves_session(gui_app, fake_bfmtool, tmp_path):

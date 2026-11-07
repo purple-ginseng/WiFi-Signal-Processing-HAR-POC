@@ -34,6 +34,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from bfmtool.collector import BFMCollector
 from bfmtool.extractor import BFMExtractor
 from bfmtool.preprocessor import BFMPreprocessor
+from bfmtool.session_stop import SessionStop
 from bfmtool.utils import append_mag_phase, get_bfm_columns, narrow_bfm_warning
 
 from functools import partial
@@ -140,6 +141,7 @@ class MainApp(tk.Tk):
 
         # BFM Settings
         self.bfm_is_setup = False
+        self.session_stop = SessionStop()
         self.bfm_collector = None
         self.bfm_extractor = None
         self.bfm_preprocessor = None
@@ -276,8 +278,15 @@ class MainApp(tk.Tk):
         self.duration_entry.insert(0, "120")
         self.duration_entry.pack(fill="x", padx=10)
 
-        self.collect_btn = ttk.Button(parent, text="Start Collection", command=self._on_collect)
-        self.collect_btn.pack(pady=10)
+        collect_row = ttk.Frame(parent)
+        collect_row.pack(pady=10)
+        self.collect_btn = ttk.Button(collect_row, text="Start Collection", command=self._on_collect)
+        self.collect_btn.pack(side="left", padx=5)
+        self.collect_stop_btn = ttk.Button(
+            collect_row, text="Stop Collection", command=self._on_stop_collection,
+            state="disabled",
+        )
+        self.collect_stop_btn.pack(side="left", padx=5)
 
         self.collect_msg = ttk.Label(parent, text="", foreground="green")
         self.collect_msg.pack()
@@ -331,6 +340,24 @@ class MainApp(tk.Tk):
             daemon=True,
         ).start()
 
+    def _on_stop_collection(self):
+        """End the running BFM session now, then ask whether to keep it."""
+        recorded = self.session_stop.request()
+        if recorded is None:
+            return   # the timer already ended this session
+        self.collect_stop_btn.config(state="disabled")
+        keep = True   # never delete a session unless the user said so
+        try:
+            keep = messagebox.askyesno(
+                "Stop Collection",
+                f"Recording stopped after {recorded:.0f} s.\n\n"
+                "Save this partial session?\n\n"
+                "Yes: save it\nNo: delete it",
+                default="yes",
+            )
+        finally:
+            self.session_stop.decide(keep)
+
     def _do_bfm_collection(self, subject, activity, description, duration):
         # --- Component 1: Initialization ---
         start_ts = None
@@ -363,6 +390,8 @@ class MainApp(tk.Tk):
             # a raw host time.time() drops every row of the session.
             capture_start_ts = start_ts + self.bfm_collector.get_clock_offset()
             self.progress.config(maximum=duration) # Set the progress bar's max value
+            self.session_stop.begin(start_ts)
+            self.collect_stop_btn.config(state="normal")
 
             # For real-time plotting
             bfm_x_data = []
@@ -370,7 +399,7 @@ class MainApp(tk.Tk):
             MAX_POINTS = 200
             last_processed_files = set()
 
-            while time.time() - start_ts < duration:
+            while time.time() - start_ts < duration and not self.session_stop.requested():
                 elapsed = time.time() - start_ts
                 self.progress['value'] = elapsed
                 self.timer_label.config(text=f"Time Remaining: {max(duration - int(elapsed), 0)}s")
@@ -426,6 +455,8 @@ class MainApp(tk.Tk):
             # abort the rest of the pipeline and leave bfm_processed_csv
             # empty with no explanation.
             status_text, status_color = "[BFM] Collection finished, but nothing was saved.", "orange"
+            recorded = self.session_stop.end()
+            self.collect_stop_btn.config(state="disabled")
 
             if self.bfm_collector is not None:
                 try:
@@ -444,7 +475,20 @@ class MainApp(tk.Tk):
                 to_be_extracted = self.bfm_collector.get_collected_files() - self.bfm_collected
                 self.bfm_collected.update(self.bfm_collector.get_collected_files())
 
-                if not to_be_extracted:
+                # Asked after the capture stops, so the router isn't left recording.
+                discard = False
+                if recorded is not None:
+                    self.timer_label.config(text="Stopped: choose save or delete…")
+                    discard = not self.session_stop.keep()
+                    duration = round(recorded, 1)   # trim to what was actually recorded
+
+                if discard:
+                    self._delete_session_pcaps(to_be_extracted)
+                    status_text, status_color = (
+                        "[BFM] Session deleted: nothing was saved.",
+                        "orange",
+                    )
+                elif not to_be_extracted:
                     status_text, status_color = (
                         "[BFM] No pcap files were captured — check that traffic is flowing "
                         "to/from the router.",
@@ -515,6 +559,14 @@ class MainApp(tk.Tk):
             self.collect_btn.config(state="normal") # Re-enable the button
             self.collect_msg.config(text=status_text, foreground=status_color)
             print(status_text)
+
+    def _delete_session_pcaps(self, pcap_files):
+        """Remove only this session's pcaps; they are already in bfm_collected."""
+        for path in pcap_files:
+            try:
+                os.remove(path)
+            except OSError as e:
+                print(f"[BFM ERROR] Could not delete {path}: {e}")
 
     def _merge_bfm_session_csv(
         self,

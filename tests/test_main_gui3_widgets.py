@@ -1,4 +1,5 @@
 """main_gui3.MainApp on a real Tk window, router faked. Needs a display."""
+import subprocess
 import os
 import shutil
 import threading
@@ -250,6 +251,121 @@ def test_bfm_session_clears_stale_buffers_first(gui3_app):
     assert "no packets were captured" in app.collect_msg.cget("text")
 
 
+# ─── Stop Collection ───────────────────────────────────────────────────────────
+def _stop_session(app, monkeypatch, keep, duration=30):
+    """Run a session on a worker, click Stop once recording; returns dialog calls."""
+    asked = []
+    monkeypatch.setattr(main_gui3.messagebox, "askyesno",
+                        lambda *a, **k: asked.append((a, k)) or keep)
+    worker = threading.Thread(target=app._do_bfm_collection,
+                              args=("alice", "walking", "", duration), daemon=True)
+
+    def click():
+        if str(app.collect_stop_btn.cget("state")) == "normal":
+            app.collect_stop_btn.invoke()
+        else:
+            app.after(20, click)
+
+    # Started inside the main loop, as Start Collection does in the real app.
+    app.after(0, worker.start)
+    app.after(300, click)
+    assert pump_until(app, lambda: worker.ident is not None and not worker.is_alive(),
+                      timeout=15)
+    return asked
+
+
+def test_stop_button_only_enabled_while_recording(gui3_app, monkeypatch):
+    app = gui3_app
+    assert str(app.collect_stop_btn.cget("state")) == "disabled"
+    app.bfm_collector = FakeCollector()
+    _stop_session(app, monkeypatch, keep=True)
+    assert str(app.collect_stop_btn.cget("state")) == "disabled"
+    assert str(app.collect_btn.cget("state")) == "normal"
+
+
+def test_stop_and_save_keeps_only_what_was_recorded(gui3_app, monkeypatch, tmp_path):
+    app = gui3_app
+    fake = FakeCollector()
+    app.bfm_collector = fake
+    # 20 rows over 10 s: most fall after Stop and must be trimmed away.
+    threading.Timer(0.1, lambda: fake.processed_buffer.append(
+        make_ratio_frame(20, t0=time.time(), fs=2.0))).start()
+
+    start = time.time()
+    asked = _stop_session(app, monkeypatch, keep=True)
+
+    assert time.time() - start < 10                  # no 30 s wait
+    assert len(asked) == 1 and "Recording stopped after" in asked[0][0][1]
+    assert asked[0][1]["default"] == "yes"           # Enter must not delete
+    csvs = list((tmp_path / "bfm_real_imag_csv").glob("*.csv"))
+    assert len(csvs) == 1
+    assert 0 < len(pd.read_csv(csvs[0])) < 20
+    waits = [c for c in fake.calls if isinstance(c, tuple)]
+    assert len(waits) == 1 and waits[0][1] < start + 10
+    assert app.collect_msg.cget("text").startswith("Saved")
+
+
+def test_stop_and_delete_saves_nothing_and_keeps_streaming(gui3_app, monkeypatch, tmp_path):
+    app = gui3_app
+    fake = FakeCollector()
+    app.bfm_collector = fake
+    (tmp_path / "live_bfm_raw_csv").mkdir()
+    threading.Timer(0.1, lambda: (
+        fake.processed_buffer.append(make_ratio_frame(12, t0=time.time(), fs=50.0)),
+        make_ratio_frame(4).to_csv("live_bfm_raw_csv/live_bfm0.csv", index=False),
+    )).start()
+
+    _stop_session(app, monkeypatch, keep=False)
+
+    assert app.collect_msg.cget("text") == "Session deleted: nothing was saved."
+    assert not list(tmp_path.glob("bfm_*"))
+    assert "stop_collection" not in fake.calls       # ready for the next session
+    assert not [c for c in fake.calls if isinstance(c, tuple)]   # no tail wait
+    assert str(app.collect_btn.cget("state")) == "normal"
+    assert app.timer_label.cget("text") == "Time Remaining: 0s"
+
+
+def test_session_after_a_delete_saves_normally(gui3_app, monkeypatch, tmp_path):
+    app = gui3_app
+    fake = FakeCollector()
+    app.bfm_collector = fake
+    (tmp_path / "live_bfm_raw_csv").mkdir()
+    threading.Timer(0.1, lambda: fake.processed_buffer.append(
+        make_ratio_frame(30, t0=time.time(), fs=50.0))).start()
+    _stop_session(app, monkeypatch, keep=False)
+    # A chunk from the deleted session must not leak into the next one.
+    make_ratio_frame(4).to_csv("live_bfm_raw_csv/deleted.csv", index=False)
+
+    _feed_processed(fake, delay=0.2, t_offset=0.0, n=12)
+    app._do_bfm_collection("alice", "standing", "", 1)
+
+    csvs = list((tmp_path / "bfm_real_imag_csv").glob("*.csv"))
+    assert len(csvs) == 1 and len(pd.read_csv(csvs[0])) == 12
+    assert not list(tmp_path.glob("bfm_raw_csv/*.csv"))
+
+
+def test_stop_after_the_timer_ended_does_nothing(gui3_app, monkeypatch):
+    app = gui3_app
+    app.bfm_collector = FakeCollector()
+    app._do_bfm_collection("alice", "walking", "", 1)
+    monkeypatch.setattr(main_gui3.messagebox, "askyesno",
+                        lambda *a, **k: pytest.fail("no session to stop"))
+    app._on_stop_collection()
+
+
+def test_failed_stop_dialog_keeps_the_session(gui3_app, monkeypatch):
+    app = gui3_app
+
+    def boom(*a, **k):
+        raise main_gui3.tk.TclError("dialog failed")
+
+    monkeypatch.setattr(main_gui3.messagebox, "askyesno", boom)
+    app.session_stop.begin(time.time())
+    with pytest.raises(main_gui3.tk.TclError):
+        app._on_stop_collection()
+    assert app.session_stop.keep() is True
+
+
 # ─── Snapshot merge into bfm_* dirs ────────────────────────────────────────────
 def test_snapshot_merges_new_session_files(gui3_app, tmp_path):
     app = gui3_app
@@ -275,6 +391,43 @@ def test_snapshot_merges_new_session_files(gui3_app, tmp_path):
     assert len(pcaps) == 1
     from scapy.all import rdpcap
     assert len(rdpcap(str(pcaps[0]))) == 2 * len(rdpcap(str(SAMPLE_PCAP)))
+
+
+def _session_chunks(tmp_path):
+    for d in ("live_bfm_pcap", "live_bfm_raw_csv", "live_bfm_processed_csv"):
+        (tmp_path / d).mkdir()
+    make_ratio_frame(4).to_csv(tmp_path / "live_bfm_raw_csv" / "live_bfm0.csv", index=False)
+    shutil.copy(SAMPLE_PCAP, tmp_path / "live_bfm_pcap" / "live_bfm0.pcap")
+
+
+def test_snapshot_merges_outside_the_gui_process(gui3_app, tmp_path, monkeypatch):
+    _session_chunks(tmp_path)
+
+    def fail(job):
+        raise AssertionError("merged in the GUI process")
+
+    monkeypatch.setattr(main_gui3.session_merge, "run_job", fail)
+    gui3_app._snapshot_session_to_bfm_dirs("a", "b", "", {"pcap": {}, "raw": {}, "proc": {}})
+    assert len(list((tmp_path / "bfm_pcap").glob("*.pcap"))) == 1
+    assert len(list((tmp_path / "bfm_raw_csv").glob("*.csv"))) == 1
+
+
+@pytest.mark.parametrize("error", [
+    subprocess.CalledProcessError(1, "merge"),
+    subprocess.TimeoutExpired("merge", 1),
+    OSError("no interpreter"),
+])
+def test_snapshot_falls_back_when_the_child_fails(gui3_app, tmp_path, monkeypatch, error):
+    """A broken child must not cost the session's merged files."""
+    _session_chunks(tmp_path)
+
+    def fail(*a, **k):
+        raise error
+
+    monkeypatch.setattr(main_gui3.subprocess, "run", fail)
+    gui3_app._snapshot_session_to_bfm_dirs("a", "b", "", {"pcap": {}, "raw": {}, "proc": {}})
+    assert len(list((tmp_path / "bfm_pcap").glob("*.pcap"))) == 1
+    assert len(list((tmp_path / "bfm_raw_csv").glob("*.csv"))) == 1
 
 
 def test_snapshot_with_nothing_new_writes_nothing(gui3_app, tmp_path):

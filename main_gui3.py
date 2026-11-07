@@ -30,6 +30,8 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from bfmtool.collector import BFMCollector
 from bfmtool.extractor import BFMExtractor
+from bfmtool import session_merge
+from bfmtool.session_stop import SessionStop
 from bfmtool.preprocessor import BFMPreprocessor
 from bfmtool.utils import (
     FULL_BFM_MHZ,
@@ -1070,6 +1072,7 @@ class MainApp(tk.Tk):
 
         self.source_mode = tk.StringVar(value="BFM-PCAP")
         self._stop_csi = threading.Event()
+        self.session_stop = SessionStop()
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -1213,8 +1216,15 @@ class MainApp(tk.Tk):
         self.duration_entry.insert(0, "120")
         self.duration_entry.pack(fill="x", padx=10)
 
-        self.collect_btn = ttk.Button(parent, text="Start Collection", command=self._on_collect)
-        self.collect_btn.pack(pady=10)
+        collect_row = ttk.Frame(parent)
+        collect_row.pack(pady=10)
+        self.collect_btn = ttk.Button(collect_row, text="Start Collection", command=self._on_collect)
+        self.collect_btn.pack(side="left", padx=5)
+        self.collect_stop_btn = ttk.Button(
+            collect_row, text="Stop Collection", command=self._on_stop_collection,
+            state="disabled",
+        )
+        self.collect_stop_btn.pack(side="left", padx=5)
 
         self.collect_msg = ttk.Label(parent, text="", foreground="green")
         self.collect_msg.pack()
@@ -1382,6 +1392,24 @@ class MainApp(tk.Tk):
             daemon=True,
         ).start()
 
+    def _on_stop_collection(self):
+        """End the running BFM session now, then ask whether to keep it."""
+        recorded = self.session_stop.request()
+        if recorded is None:
+            return   # the timer already ended this session
+        self.collect_stop_btn.config(state="disabled")
+        keep = True   # never delete a session unless the user said so
+        try:
+            keep = messagebox.askyesno(
+                "Stop Collection",
+                f"Recording stopped after {recorded:.0f} s.\n\n"
+                "Save this partial session?\n\n"
+                "Yes: save it\nNo: delete it",
+                default="yes",
+            )
+        finally:
+            self.session_stop.decide(keep)
+
     def _do_bfm_collection(self, subject, activity, description, duration):
         """
         Run a single labeled streaming session. The download/processing threads
@@ -1402,6 +1430,7 @@ class MainApp(tk.Tk):
         # Session start expressed in the router's clock; set once tcpdump is
         # running so the finally block can trim to exactly the requested window.
         capture_start_ts = None
+        discard = False
 
         # Mark which files were already in the live dirs before this session.
         # Chunk names restart at live_bfm0 after Setup BFM, so mtimes are kept too.
@@ -1425,8 +1454,10 @@ class MainApp(tk.Tk):
             start_ts = time.time()
             capture_start_ts = start_ts + self.bfm_collector.get_clock_offset()
             self.progress.config(maximum=duration)
+            self.session_stop.begin(start_ts)
+            self.collect_stop_btn.config(state="normal")
 
-            while time.time() - start_ts < duration:
+            while time.time() - start_ts < duration and not self.session_stop.requested():
                 elapsed = time.time() - start_ts
                 self.progress["value"] = elapsed
                 self.timer_label.config(
@@ -1435,23 +1466,38 @@ class MainApp(tk.Tk):
                 # Plot + status refresh is driven by _streaming_tick on the main thread
                 time.sleep(0.2)
 
+            recorded = self.session_stop.end()
+            if recorded is not None:
+                self.timer_label.config(text="Stopped: choose save or delete…")
+                discard = not self.session_stop.keep()
+                duration = round(recorded, 1)   # trim to what was actually recorded
+
             # The capture pipeline runs behind the clock, so the last seconds of
             # the window are still being rotated/downloaded/parsed right now.
             # Hold until they land, otherwise the saved CSV stops short of the
             # requested duration.
-            self.timer_label.config(text="Finishing capture…")
-            self.bfm_collector.wait_for_capture_through(capture_start_ts + duration)
+            if not discard:
+                self.timer_label.config(text="Finishing capture…")
+                self.bfm_collector.wait_for_capture_through(capture_start_ts + duration)
 
         except Exception as e:
             self.collect_msg.config(text=f"Error: {e}", foreground="red")
             print(f"[BFM ERROR] {e}")
 
         finally:
+            self.session_stop.end()
+            self.collect_stop_btn.config(state="disabled")
+
             # Save two versions of the session from the in-RAM buffers: real/imag
             # ratios (before conversion) → bfm_real_imag_csv/, and magnitude/phase
             # (after conversion) → bfm_mag_phase_csv/, sharing the same session
             # metadata and timestamp.
-            if self.bfm_collector is not None:
+            if discard:
+                # Nothing reaches bfm_* until here, and chunks are matched per session.
+                self.collect_msg.config(
+                    text="Session deleted: nothing was saved.", foreground="orange"
+                )
+            elif self.bfm_collector is not None:
                 df_real_imag = self.bfm_collector.processed_buffer.tail()
 
                 # Trim to exactly the duration requested in the GUI. Streaming
@@ -1499,23 +1545,14 @@ class MainApp(tk.Tk):
                         "mp", subject, activity, description, ts
                     )
 
-                    # 1) Real/imag ratios → bfm_real_imag_csv/
+                    # Real/imag and mag/phase CSVs are written and converted off the GUI process.
                     df_real_imag["subject"] = subject
                     df_real_imag["activity"] = activity
-                    os.makedirs("bfm_real_imag_csv", exist_ok=True)
-                    df_real_imag.to_csv(
-                        os.path.join("bfm_real_imag_csv", ri_name), index=False
-                    )
-
-                    # 2) Magnitude/phase → bfm_mag_phase_csv/
-                    df_mag_phase = convert_real_imag_to_mag_phase(df_real_imag, [], [])
-                    os.makedirs("bfm_mag_phase_csv", exist_ok=True)
-                    if not df_mag_phase.empty:
-                        df_mag_phase["subject"] = subject
-                        df_mag_phase["activity"] = activity
-                        df_mag_phase.to_csv(
-                            os.path.join("bfm_mag_phase_csv", mp_name), index=False
-                        )
+                    session_merge.run_in_child({
+                        "df": df_real_imag,
+                        "ri_path": os.path.join("bfm_real_imag_csv", ri_name),
+                        "mp_path": os.path.join("bfm_mag_phase_csv", mp_name),
+                    })
 
                     saved_text = (
                         f"Saved {len(df_real_imag)} BFM packets → "
@@ -1553,9 +1590,10 @@ class MainApp(tk.Tk):
             # clicked.
 
             # 2) Snapshot the new files into the canonical bfm_* directories
-            self._snapshot_session_to_bfm_dirs(
-                subject, activity, description, snapshot_before
-            )
+            if not discard:
+                self._snapshot_session_to_bfm_dirs(
+                    subject, activity, description, snapshot_before
+                )
 
             self.progress["value"] = 0
             self.timer_label.config(text="Time Remaining: 0s")
@@ -1569,9 +1607,8 @@ class MainApp(tk.Tk):
         directory, named with the session metadata and timestamp to match the
         existing labeled-training corpus convention (one file per session).
 
-        - PCAPs: concatenated with scapy (rdpcap + wrpcap) so the merged file
-          is still a valid libpcap container.
-        - CSVs: concatenated with pandas (single header row, all rows below).
+        Runs in a child process (see bfmtool/session_merge.py) so it can't starve
+        Tk of the GIL while the user types the next session's details.
         """
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         out_basename = (
@@ -1591,54 +1628,19 @@ class MainApp(tk.Tk):
         pcap_files = _new_files("live_bfm_pcap", snapshot_before["pcap"])
         raw_files = _new_files("live_bfm_raw_csv", snapshot_before["raw"])
 
-        # 1) Merge pcaps with scapy
-        if pcap_files:
-            os.makedirs("bfm_pcap", exist_ok=True)
-            dst_pcap = os.path.join("bfm_pcap", out_basename + ".pcap")
-            try:
-                from scapy.all import rdpcap, wrpcap
+        if not pcap_files and not raw_files:
+            return
 
-                merged = []
-                for f in pcap_files:
-                    try:
-                        merged.extend(rdpcap(f))
-                    except Exception as e:
-                        print(f"[Snapshot] Skipping unreadable pcap {f}: {e}")
-                if merged:
-                    wrpcap(dst_pcap, merged)
-                    print(
-                        f"[Snapshot] Wrote {dst_pcap}  ({len(merged)} frames from {len(pcap_files)} chunks)"
-                    )
-            except Exception as e:
-                print(f"[Snapshot] PCAP merge failed: {e}")
-
-        # 2) Merge raw CSVs with pandas (single header, all rows). The processed
-        #    (real/imag) and mag/phase session CSVs are written separately by
-        #    _do_bfm_collection into bfm_real_imag_csv/ and bfm_mag_phase_csv/.
-        for src_files, dst_dir in (
-            (raw_files, "bfm_raw_csv"),
-        ):
-            if not src_files:
-                continue
-            os.makedirs(dst_dir, exist_ok=True)
-            dst_csv = os.path.join(dst_dir, out_basename + ".csv")
-            try:
-                frames = []
-                for f in src_files:
-                    try:
-                        df = pd.read_csv(f)
-                        if not df.empty:
-                            frames.append(df)
-                    except Exception as e:
-                        print(f"[Snapshot] Skipping bad CSV {f}: {e}")
-                if frames:
-                    merged_df = pd.concat(frames, ignore_index=True)
-                    merged_df.to_csv(dst_csv, index=False)
-                    print(
-                        f"[Snapshot] Wrote {dst_csv}  ({len(merged_df)} rows from {len(src_files)} chunks)"
-                    )
-            except Exception as e:
-                print(f"[Snapshot] CSV merge failed for {dst_dir}: {e}")
+        # The processed and mag/phase CSVs are written by _do_bfm_collection.
+        os.makedirs("bfm_pcap", exist_ok=True)
+        os.makedirs("bfm_raw_csv", exist_ok=True)
+        job = {
+            "pcaps": pcap_files,
+            "raws": raw_files,
+            "dst_pcap": os.path.join("bfm_pcap", out_basename + ".pcap"),
+            "dst_csv": os.path.join("bfm_raw_csv", out_basename + ".csv"),
+        }
+        session_merge.run_in_child(job)
 
     # ─── Periodic UI tick (runs on Tk main thread) ─────────────────────────
     def _streaming_tick(self):
